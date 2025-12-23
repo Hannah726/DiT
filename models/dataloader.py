@@ -23,7 +23,9 @@ class EHRTokenDataset(Dataset):
     - hi_input(_reduced).npy: text tokens (N, E, T)
     - hi_type.npy: type tokens (N, E, T)  
     - hi_dpe.npy: digit-place embeddings (N, E, T)  
-    - hi_time.npy: time tokens (N, E, 2)  
+    - hi_time.npy: time tokens (N, E, 2) or (N, E, 3)
+      * 6/12 h: (N, E, 2) -> padding to (N, E, 3)
+      * 24 h: (N, E, 3)
     - OR con_time_12.npy: continuous time (N, E, 1)  
     """
     
@@ -113,8 +115,16 @@ class EHRTokenDataset(Dataset):
         if self.use_continuous_time:
             time = self.time_data[real_idx]  # (243, 1)
         else:
-            time = self.time_data[real_idx]  # (243, 2)
+            time = self.time_data[real_idx]  # (243, 2) or (243, 3)
             time = np.array(time, dtype=np.int64)
+            if time.shape[1] == 2:
+                time_padded = np.zeros((time.shape[0], 3), dtype=np.int64)
+                time_padded[:, 1:3] = time  # original data in the second and third place
+                time = time_padded
+            elif time.shape[1] == 3:
+                pass
+            else:
+                raise ValueError(f"Unexpected time dimension: {time.shape[1]}, expected 2 or 3")
         
         # Create event mask (1 for valid events, 0 for padding)
         # Assume event is valid if any token is non-zero

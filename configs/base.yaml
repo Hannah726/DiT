@@ -16,7 +16,7 @@ model:
   num_heads: 8
   dropout: 0.1
   time_vocab_size: 10  # 0-9 for discrete time
-  time_dim: 2  # 2 digits for time
+  time_dim: 3  # 3 digits for time
 
 # Training
 training:

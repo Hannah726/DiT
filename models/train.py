@@ -38,7 +38,9 @@ def compute_loss(
     pred_text = model_output['pred_text']  # (B, E, T, vocab_text)
     pred_type = model_output['pred_type']
     pred_dpe = model_output['pred_dpe']
-    pred_time = model_output['pred_time']  # (B, E, vocab_time) or (B, E, 1)
+    # For discrete time: pred_time is (B, E, 2, vocab_time), but we use pred_time_digit1/digit2
+    # For continuous time: pred_time is (B, E, 1)
+    pred_time = model_output['pred_time']
     
     token_mask = model_output['token_mask']  # (B, E, T)
     time_mask = model_output['time_mask']  # (B, E)
@@ -94,22 +96,91 @@ def compute_loss(
     
     # Compute time loss
     if time_discrete:
+        pred_time_digit1 = model_output['pred_time_digit1']  # (B, E, vocab_time)
+        pred_time_digit2 = model_output['pred_time_digit2']  # (B, E, vocab_time)
+        pred_time_digit3 = model_output['pred_time_digit3']  # (B, E, vocab_time)
+        
+        if true_time.shape[2] < 3:
+            # Pad 2D time to 3D: [7, 2] -> [0, 7, 2] (left padding with 0)
+            true_time_padded = torch.zeros(
+                (true_time.shape[0], true_time.shape[1], 3),
+                dtype=true_time.dtype,
+                device=true_time.device
+            )
+            true_time_padded[:, :, 1:1+true_time.shape[2]] = true_time
+            true_time = true_time_padded
+        
+        # For 6/12h data: digit1=0 (padding, invalid), digit2 and digit3 are valid
+        # For 24h data: all digits are valid
+        # So: digit1 is valid only when it's not 0 (24h data)
+        #     digit2 and digit3 are always valid
+        digit1_valid = (true_time[:, :, 0] != 0)  # (B, E) - first digit valid mask
+        
         if time_mask is not None:
             # Only on masked time positions
-            # Assuming pred_time: (B, E, vocab_time)
-            # and true_time: (B, E, 2) - two digits
-            # For simplicity, predict first digit
-            loss_time = F.cross_entropy(
-                pred_time[time_mask],
-                true_time[:, :, 0][time_mask],
+            # Digit 1 loss (only compute when valid, i.e., for 24h data)
+            if digit1_valid.any():
+                digit1_mask = time_mask & digit1_valid
+                if digit1_mask.any():
+                    loss_time_digit1 = F.cross_entropy(
+                        pred_time_digit1[digit1_mask],
+                        true_time[:, :, 0][digit1_mask],
+                        reduction='mean'
+                    )
+                else:
+                    loss_time_digit1 = torch.tensor(0.0, device=true_time.device)
+            else:
+                loss_time_digit1 = torch.tensor(0.0, device=true_time.device)
+            
+            # Digit 2 loss (always valid)
+            loss_time_digit2 = F.cross_entropy(
+                pred_time_digit2[time_mask],
+                true_time[:, :, 1][time_mask],
+                reduction='mean'
+            )
+            
+            # Digit 3 loss (always valid)
+            loss_time_digit3 = F.cross_entropy(
+                pred_time_digit3[time_mask],
+                true_time[:, :, 2][time_mask],
                 reduction='mean'
             )
         else:
-            loss_time = F.cross_entropy(
-                pred_time.reshape(-1, pred_time.size(-1)),
-                true_time[:, :, 0].reshape(-1),
+            # Compute loss on all positions
+            # Digit 1 loss (only compute when valid)
+            if digit1_valid.any():
+                digit1_flat = digit1_valid.reshape(-1)
+                if digit1_flat.any():
+                    loss_time_digit1 = F.cross_entropy(
+                        pred_time_digit1.reshape(-1, pred_time_digit1.size(-1))[digit1_flat],
+                        true_time[:, :, 0].reshape(-1)[digit1_flat],
+                        reduction='mean'
+                    )
+                else:
+                    loss_time_digit1 = torch.tensor(0.0, device=true_time.device)
+            else:
+                loss_time_digit1 = torch.tensor(0.0, device=true_time.device)
+            
+            # Digit 2 loss (always valid)
+            loss_time_digit2 = F.cross_entropy(
+                pred_time_digit2.reshape(-1, pred_time_digit2.size(-1)),
+                true_time[:, :, 1].reshape(-1),
                 reduction='mean'
             )
+            
+            # Digit 3 loss (always valid)
+            loss_time_digit3 = F.cross_entropy(
+                pred_time_digit3.reshape(-1, pred_time_digit3.size(-1)),
+                true_time[:, :, 2].reshape(-1),
+                reduction='mean'
+            )
+        
+        # Total time loss: average of valid digits
+        # If digit1 is valid (24h data), average all three; otherwise average digit2 and digit3
+        if digit1_valid.any():
+            loss_time = (loss_time_digit1 + loss_time_digit2 + loss_time_digit3) / 3.0
+        else:
+            loss_time = (loss_time_digit2 + loss_time_digit3) / 2.0
     else:
         # Continuous time - MSE loss
         if time_mask is not None:

@@ -37,13 +37,14 @@ class TimeEmbedding(nn.Module):
         """
         Args:
             time: (B, 243, time_dim) if discrete, (B, 243, 1) if continuous
+                  For discrete: time_dim=3 (unified 3D, 6/12h data has digit1=0 as padding)
         Returns:
             (B, 243, hidden_dim)
         """
         if self.discrete:
-            # time: (B, 243, 2) with values 0-9
-            # Embed each digit and sum/mean
-            emb = self.time_embed(time)  # (B, 243, 2, D)
+            # time: (B, 243, 3) with values 0-9
+            # Embed each digit and average
+            emb = self.time_embed(time)  # (B, 243, 3, D)
             return emb.mean(dim=2)  # (B, 243, D)
         else:
             return self.time_mlp(time)  # (B, 243, D)
@@ -143,7 +144,12 @@ class MDLM(nn.Module):
         self.dpe_head = nn.Linear(hidden_dim, vocab_size_dpe)
         
         if time_discrete:
-            self.time_head = nn.Linear(hidden_dim, time_vocab_size)
+            # Three independent prediction heads for three digits (unified time_dim=3)
+            # For 6/12h data: digit1=0 (padding), digit2 and digit3 are original digits
+            # For 24h data: all three digits are valid
+            self.time_digit1_head = nn.Linear(hidden_dim, time_vocab_size)  # Predict first digit
+            self.time_digit2_head = nn.Linear(hidden_dim, time_vocab_size)  # Predict second digit
+            self.time_digit3_head = nn.Linear(hidden_dim, time_vocab_size)  # Predict third digit
         else:
             self.time_head = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
@@ -287,7 +293,15 @@ class MDLM(nn.Module):
         pred_dpe = self.dpe_head(h_flat)
         
         # Predict time
-        pred_time = self.time_head(h)  # (B, E, vocab_time) or (B, E, 1)
+        if self.time_discrete:
+            # Three independent predictions for three digits (unified time_dim=3)
+            pred_time_digit1 = self.time_digit1_head(h)  # (B, E, vocab_time) - first digit
+            pred_time_digit2 = self.time_digit2_head(h)  # (B, E, vocab_time) - second digit
+            pred_time_digit3 = self.time_digit3_head(h)  # (B, E, vocab_time) - third digit
+            # Stack three predictions to (B, E, 3, vocab_time)
+            pred_time = torch.stack([pred_time_digit1, pred_time_digit2, pred_time_digit3], dim=2)  # (B, E, 3, vocab_time)
+        else:
+            pred_time = self.time_head(h)  # (B, E, 1)
         
         # Reshape predictions
         pred_text = pred_text.reshape(B, E, T, self.vocab_size_text)
@@ -302,6 +316,12 @@ class MDLM(nn.Module):
             'token_mask': token_mask,
             'time_mask': time_mask
         }
+        
+        # For discrete time, also return individual digit predictions
+        if self.time_discrete:
+            result['pred_time_digit1'] = pred_time_digit1  # (B, E, vocab_time)
+            result['pred_time_digit2'] = pred_time_digit2  # (B, E, vocab_time)
+            result['pred_time_digit3'] = pred_time_digit3  # (B, E, vocab_time)
         
         return result
     
@@ -335,8 +355,9 @@ class MDLM(nn.Module):
         )
         
         if self.time_discrete:
+            # Unified time_dim=3
             time_data = torch.full(
-                (batch_size, self.max_events, 2),
+                (batch_size, self.max_events, 3),
                 self.mask_token_id,
                 dtype=torch.long,
                 device=device
@@ -386,16 +407,30 @@ class MDLM(nn.Module):
                 time_to_unmask = time_to_unmask & time_mask
                 
                 if time_to_unmask.any():
-                    pred_time = output['pred_time'] / temperature  # (B, E, vocab_time)
+                    # Use three independent prediction heads
+                    pred_digit1 = output['pred_time_digit1'] / temperature  # (B, E, vocab_time)
+                    pred_digit2 = output['pred_time_digit2'] / temperature  # (B, E, vocab_time)
+                    pred_digit3 = output['pred_time_digit3'] / temperature  # (B, E, vocab_time)
+                    
                     # Sample first digit
-                    sampled_digit = torch.argmax(
-                        pred_time[time_to_unmask], dim=-1
+                    sampled_digit1 = torch.argmax(
+                        pred_digit1[time_to_unmask], dim=-1
                     )
-                    time_data[:, :, 0][time_to_unmask] = sampled_digit
-                    # For simplicity, use same prediction for second digit
-                    # TODO: Implement separate prediction head for second digit
+                    time_data[:, :, 0][time_to_unmask] = sampled_digit1
+                    
+                    # Sample second digit
                     if time_data.shape[2] > 1:
-                        time_data[:, :, 1][time_to_unmask] = sampled_digit
+                        sampled_digit2 = torch.argmax(
+                            pred_digit2[time_to_unmask], dim=-1
+                        )
+                        time_data[:, :, 1][time_to_unmask] = sampled_digit2
+                    
+                    # Sample third digit (unified time_dim=3)
+                    if time_data.shape[2] > 2:
+                        sampled_digit3 = torch.argmax(
+                            pred_digit3[time_to_unmask], dim=-1
+                        )
+                        time_data[:, :, 2][time_to_unmask] = sampled_digit3
             else:
                 time_data = output['pred_time']
         
