@@ -167,17 +167,48 @@ class EHRDiffusionModel(nn.Module):
         """
         return self.decoder(event_latent, return_logits=return_logits)
     
-    def decode_time(self, time_emb):
+    def decode_time(self, time_emb, denormalize: bool = False):
         """
         Decode time embedding back to continuous time
         
         Args:
             time_emb: (B, N, time_dim) - time embeddings
+            denormalize: Whether to apply exp transformation (default: False)
+                       Set to True if time was log-normalized during encoding
         
         Returns:
-            (B, N, 1) - continuous time intervals (log-normalized)
+            (B, N, 1) - continuous time intervals (log-normalized if denormalize=False)
         """
-        return self.time_decoder(time_emb)
+        con_time = self.time_decoder(time_emb)
+        if denormalize:
+            # Apply exp to reverse log-normalization
+            con_time = torch.exp(con_time)
+        return con_time
+    
+    def decode_joint_latent(self, joint_latent, return_logits=False, denormalize_time=False):
+        """
+        Decode joint latent to events and time
+        
+        Args:
+            joint_latent: (B, N, event_dim + time_dim) - joint latent from diffusion
+            return_logits: Whether to return logits for event decoding
+            denormalize_time: Whether to denormalize time (apply exp transformation)
+        
+        Returns:
+            decoded_events: dict with keys 'token', 'type', 'dpe', each (B, N, L)
+            decoded_time: (B, N, 1) - continuous time intervals
+        """
+        # Split event and time latents
+        event_latent = joint_latent[..., :self.event_dim]  # (B, N, event_dim)
+        time_emb = joint_latent[..., self.event_dim:]      # (B, N, time_dim)
+        
+        # Decode events
+        decoded_events = self.decoder(event_latent, return_logits=return_logits)
+        
+        # Decode time
+        decoded_time = self.decode_time(time_emb, denormalize=denormalize_time)
+        
+        return decoded_events, decoded_time
     
     def forward(
         self,

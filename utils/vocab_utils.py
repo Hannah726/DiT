@@ -113,24 +113,44 @@ def decode_output_with_vocab(
     return decoded_output
 
 
+def denormalize_time(log_time: np.ndarray) -> np.ndarray:
+    """
+    Denormalize log-normalized time values by applying exp transformation
+    
+    Args:
+        log_time: (B, N, 1) or (B, N) - log-normalized time values
+    
+    Returns:
+        (B, N, 1) or (B, N) - denormalized time values (original scale)
+    """
+    return np.exp(log_time)
+
+
 def save_decoded_output(
     decoded_output: Dict[str, np.ndarray],
     output_dir: str,
     ehr_name: str = 'mimiciv',
     structure: str = 'hi',
     convert_to_input: bool = True,
-    data_dir: Optional[str] = None
+    data_dir: Optional[str] = None,
+    denormalize_time_values: bool = False
 ):
     """
     Save decoded output to numpy files, optionally converting tokens to original input format
     
+    Note: Token sequences are kept in (B, N, L) format for complete evaluation.
+    No pooling is applied to preserve full token-level information.
+    
     Args:
         decoded_output: Dictionary with keys 'token', 'type', 'dpe', 'time'
+                       'token', 'type', 'dpe' should be (B, N, L) arrays
+                       'time' should be (B, N, 1) array
         output_dir: Directory to save output files
         ehr_name: Name of EHR dataset
         structure: Data structure name (default: 'hi')
         convert_to_input: Whether to convert token IDs to original input format
         data_dir: Directory containing id2word.pkl (required if convert_to_input=True)
+        denormalize_time_values: Whether to apply exp transformation to time values
     """
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -144,6 +164,10 @@ def save_decoded_output(
             data_dir,
             ehr_name
         )
+    
+    # Denormalize time if requested
+    if denormalize_time_values and 'time' in decoded_output:
+        decoded_output['time'] = denormalize_time(decoded_output['time'])
     
     # Save each component
     filename_map = {

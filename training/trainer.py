@@ -241,6 +241,25 @@ class EHRDiffusionTrainer:
             'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else 0.0,
         }
         
+        # Decode for monitoring (optional, only for logging)
+        # Note: This is for visualization/monitoring, not used in loss
+        if self.global_step % (self.log_interval * 10) == 0:  # Less frequent to save compute
+            with torch.no_grad():
+                # Decode joint latent to get events and time
+                decoded_events, decoded_time = self.model.decode_joint_latent(
+                    joint_latent,
+                    return_logits=False,
+                    denormalize_time=False  # Keep log-normalized for consistency
+                )
+                # decoded_events: dict with 'token' (B, N, L), 'type' (B, N, L), 'dpe' (B, N, L)
+                # decoded_time: (B, N, 1) - log-normalized
+                
+                # Optional: Compute time reconstruction error for monitoring
+                time_recon_error = F.mse_loss(decoded_time, con_time, reduction='mean')
+                metrics['time_recon_error'] = time_recon_error.item()
+        else:
+            metrics['time_recon_error'] = 0.0
+        
         return total_loss.item(), metrics
     
     @torch.no_grad()
