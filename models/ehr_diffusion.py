@@ -23,9 +23,10 @@ class EHRDiffusionModel(nn.Module):
         1. Structured Event Encoder: (token, type, dpe) -> event_latent
         2. Time Encoder: continuous_time -> time_emb
         3. Joint Latent: [event_latent, time_emb]
-        4. Demographic Encoder: demographics -> condition
-        5. DiT: Denoising diffusion in joint latent space
+        4. Demographic Encoder: demographics -> condition (optional, not used in training)
+        5. DiT: Denoising diffusion in joint latent space (handles demographics internally)
         6. Event Decoder: event_latent -> (token, type, dpe)
+        7. Time Decoder: time_emb -> continuous_time
     
     Args:
         vocab_size: Size of token vocabulary
@@ -167,32 +168,53 @@ class EHRDiffusionModel(nn.Module):
         """
         return self.decoder(event_latent, return_logits=return_logits)
     
-    def decode_time(self, time_emb, denormalize: bool = False):
+    def decode_time(self, time_emb, denormalize: bool = False, 
+                    mean_log_time: float = None, std_log_time: float = None):
         """
         Decode time embedding back to continuous time
         
         Args:
             time_emb: (B, N, time_dim) - time embeddings
-            denormalize: Whether to apply exp transformation (default: False)
-                       Set to True if time was log-normalized during encoding
+            denormalize: Whether to denormalize to original scale (default: False)
+            mean_log_time: Mean of log-transformed time for denormalization
+            std_log_time: Std of log-transformed time for denormalization
         
         Returns:
-            (B, N, 1) - continuous time intervals (log-normalized if denormalize=False)
+            (B, N, 1) - time intervals (raw hours if denormalize=True, 
+                         normalized log-time otherwise)
         """
         con_time = self.time_decoder(time_emb)
+        
         if denormalize:
-            # Apply exp to reverse log-normalization
-            con_time = torch.exp(con_time)
+            if mean_log_time is None or std_log_time is None:
+                raise ValueError(
+                    "Denormalization requires mean_log_time and std_log_time. "
+                    "These should be computed from your training data."
+                )
+            
+            # Step 1: Denormalize z-score
+            log_time = con_time * std_log_time + mean_log_time
+            
+            # Step 2: Reverse log1p transformation
+            raw_time = torch.expm1(log_time)  # expm1(x) = exp(x) - 1
+            
+            return raw_time
+        
         return con_time
     
-    def decode_joint_latent(self, joint_latent, return_logits=False, denormalize_time=False):
+    def decode_joint_latent(self, joint_latent, return_logits=False, 
+                            denormalize_time=False, 
+                            mean_log_time: float = None, 
+                            std_log_time: float = None):
         """
         Decode joint latent to events and time
         
         Args:
             joint_latent: (B, N, event_dim + time_dim) - joint latent from diffusion
             return_logits: Whether to return logits for event decoding
-            denormalize_time: Whether to denormalize time (apply exp transformation)
+            denormalize_time: Whether to denormalize time to original hours
+            mean_log_time: Mean of log-transformed time (for denormalization)
+            std_log_time: Std of log-transformed time (for denormalization)
         
         Returns:
             decoded_events: dict with keys 'token', 'type', 'dpe', each (B, N, L)
@@ -206,7 +228,12 @@ class EHRDiffusionModel(nn.Module):
         decoded_events = self.decoder(event_latent, return_logits=return_logits)
         
         # Decode time
-        decoded_time = self.decode_time(time_emb, denormalize=denormalize_time)
+        decoded_time = self.decode_time(
+            time_emb, 
+            denormalize=denormalize_time,
+            mean_log_time=mean_log_time,
+            std_log_time=std_log_time
+        )
         
         return decoded_events, decoded_time
     
@@ -223,17 +250,21 @@ class EHRDiffusionModel(nn.Module):
         """
         Full forward pass for reconstruction (debugging/validation)
         
+        Note: This method is for encoder-decoder reconstruction testing only.
+        Demographics parameter is kept for interface consistency but not used here.
+        For diffusion training, use the training loop which properly handles demographics.
+        
         Args:
             input_ids: (B, N, L) - token IDs
             type_ids: (B, N, L) - type IDs
             dpe_ids: (B, N, L) - DPE IDs
             con_time: (B, N, 1) - continuous time intervals
-            demographics: (B, D) - demographic features
+            demographics: (B, D) - demographic features (not used in this method)
             mask: (B, N) - valid event mask
             return_latents: Whether to return latent codes
         
         Returns:
-            reconstructed: dict with keys 'token', 'type', 'dpe'
+            reconstructed: dict with keys 'token', 'type', 'dpe', 'time'
             (optional) latents: dict with latent representations
         """
         # Create token-level mask

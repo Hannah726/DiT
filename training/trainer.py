@@ -181,15 +181,13 @@ class EHRDiffusionTrainer:
             # Sample timesteps
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
             
-            # Encode demographics
-            demo_emb = self.model.demographic_encoder(demographics)  # (B, demo_dim)
-            
             # Diffusion loss
             noise = torch.randn_like(joint_latent)
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
             
-            # Predict noise
-            predicted_noise = self.model.dit(noisy_latent, t, condition=demo_emb, mask=mask)
+            # Predict noise - DiT handles demographics encoding internally via condition_embedder
+            # demographics: (B, 2) -> DiT condition_embedder -> (B, hidden_dim)
+            predicted_noise = self.model.dit(noisy_latent, t, condition=demographics, mask=mask)
             
             # Compute diffusion loss
             if mask is not None:
@@ -300,13 +298,12 @@ class EHRDiffusionTrainer:
             # Sample timesteps
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
             
-            # Encode demographics
-            demo_emb = self.model.demographic_encoder(demographics)
-            
             # Diffusion loss
             noise = torch.randn_like(joint_latent)
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
-            predicted_noise = self.model.dit(noisy_latent, t, condition=demo_emb, mask=mask)
+            
+            # Predict noise - DiT will handle demographics encoding internally
+            predicted_noise = self.model.dit(noisy_latent, t, condition=demographics, mask=mask)
             
             if mask is not None:
                 mask_expanded = mask.unsqueeze(-1)

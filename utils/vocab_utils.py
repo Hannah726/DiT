@@ -113,17 +113,28 @@ def decode_output_with_vocab(
     return decoded_output
 
 
-def denormalize_time(log_time: np.ndarray) -> np.ndarray:
+def denormalize_time(log_time: np.ndarray, mean_log_time: float = None, std_log_time: float = None) -> np.ndarray:
     """
-    Denormalize log-normalized time values by applying exp transformation
+    Denormalize log-normalized time values
+    
+    Note: This assumes time was normalized using z-score after log1p transformation.
+    If mean_log_time and std_log_time are provided, performs full denormalization.
+    Otherwise, only applies expm1 (reverse log1p).
     
     Args:
-        log_time: (B, N, 1) or (B, N) - log-normalized time values
+        log_time: (B, N, 1) or (B, N) - normalized log-time values
+        mean_log_time: Mean of log-transformed time (for z-score denormalization)
+        std_log_time: Std of log-transformed time (for z-score denormalization)
     
     Returns:
-        (B, N, 1) or (B, N) - denormalized time values (original scale)
+        (B, N, 1) or (B, N) - denormalized time values (raw hours)
     """
-    return np.exp(log_time)
+    # If mean and std provided, denormalize z-score first
+    if mean_log_time is not None and std_log_time is not None:
+        log_time = log_time * std_log_time + mean_log_time
+    
+    # Reverse log1p transformation: expm1(x) = exp(x) - 1
+    return np.expm1(log_time)
 
 
 def save_decoded_output(
@@ -133,7 +144,9 @@ def save_decoded_output(
     structure: str = 'hi',
     convert_to_input: bool = True,
     data_dir: Optional[str] = None,
-    denormalize_time_values: bool = False
+    denormalize_time_values: bool = False,
+    mean_log_time: Optional[float] = None,
+    std_log_time: Optional[float] = None
 ):
     """
     Save decoded output to numpy files, optionally converting tokens to original input format
@@ -150,7 +163,9 @@ def save_decoded_output(
         structure: Data structure name (default: 'hi')
         convert_to_input: Whether to convert token IDs to original input format
         data_dir: Directory containing id2word.pkl (required if convert_to_input=True)
-        denormalize_time_values: Whether to apply exp transformation to time values
+        denormalize_time_values: Whether to denormalize time to original hours
+        mean_log_time: Mean of log-transformed time (required if denormalize_time_values=True)
+        std_log_time: Std of log-transformed time (required if denormalize_time_values=True)
     """
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -167,7 +182,15 @@ def save_decoded_output(
     
     # Denormalize time if requested
     if denormalize_time_values and 'time' in decoded_output:
-        decoded_output['time'] = denormalize_time(decoded_output['time'])
+        if mean_log_time is None or std_log_time is None:
+            raise ValueError(
+                "mean_log_time and std_log_time must be provided when denormalize_time_values=True"
+            )
+        decoded_output['time'] = denormalize_time(
+            decoded_output['time'],
+            mean_log_time=mean_log_time,
+            std_log_time=std_log_time
+        )
     
     # Save each component
     filename_map = {
