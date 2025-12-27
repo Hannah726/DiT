@@ -135,7 +135,7 @@ class StructuredEventEncoder(nn.Module):
         vocab_sizes: dict,  # {'token': int, 'type': int, 'dpe': int}
         embed_dims: dict,   # {'token': int, 'type': int, 'dpe': int}
         hidden_dim: int = 256,
-        event_dim: int = 32,
+        event_dim: int = 64,
         dropout: float = 0.1,
         padding_idx: int = 0
     ):

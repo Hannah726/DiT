@@ -12,6 +12,7 @@ from models.encoder.time_encoder import TimeEncoder
 from models.conditioning.demographic_encoder import DemographicEncoder
 from models.diffusion.dit import DiT
 from models.decoder.event_decoder import EventDecoder
+from models.decoder.time_decoder import TimeDecoder
 
 
 class EHRDiffusionModel(nn.Module):
@@ -117,6 +118,14 @@ class EHRDiffusionModel(nn.Module):
             max_token_len=max_token_len,
             dropout=dropout
         )
+        
+        # 6. Time Decoder
+        self.time_decoder = TimeDecoder(
+            time_dim=time_dim,
+            hidden_dim=128,
+            output_dim=1,
+            dropout=dropout
+        )
     
     def encode(self, input_ids, type_ids, dpe_ids, con_time, event_mask=None):
         """
@@ -158,6 +167,18 @@ class EHRDiffusionModel(nn.Module):
         """
         return self.decoder(event_latent, return_logits=return_logits)
     
+    def decode_time(self, time_emb):
+        """
+        Decode time embedding back to continuous time
+        
+        Args:
+            time_emb: (B, N, time_dim) - time embeddings
+        
+        Returns:
+            (B, N, 1) - continuous time intervals (log-normalized)
+        """
+        return self.time_decoder(time_emb)
+    
     def forward(
         self,
         input_ids,
@@ -195,6 +216,8 @@ class EHRDiffusionModel(nn.Module):
         
         # Decode
         reconstructed = self.decode(event_latent, return_logits=False)
+        reconstructed_time = self.decode_time(time_emb)
+        reconstructed['time'] = reconstructed_time
         
         if return_latents:
             latents = {
