@@ -6,11 +6,14 @@ Supports single-GPU and multi-GPU distributed training
 import os
 import sys
 import argparse
+import json
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import numpy as np
+from tqdm import tqdm
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -262,6 +265,70 @@ def main():
     logger.info(f"Val dataset size: {len(val_dataset)}")
     logger.info(f"Vocab size: {train_dataset.vocab_size}")
     
+    # Compute time statistics from training data
+    if rank == 0:  # Only compute on rank 0 to avoid duplicate computation
+        logger.info("Computing time statistics from training data...")
+        train_times = []
+        
+        # Collect all valid time values from training set
+        for i in tqdm(range(len(train_dataset)), desc="Collecting time values", disable=(rank != 0)):
+            sample = train_dataset[i]
+            con_time = sample['con_time']  # (max_events, 1) or (max_events,)
+            mask = sample['mask']  # (max_events,)
+            
+            # Convert to numpy if tensor
+            if isinstance(con_time, torch.Tensor):
+                con_time = con_time.numpy()
+            if isinstance(mask, torch.Tensor):
+                mask = mask.numpy()
+            
+            # Flatten and filter valid times (non-padding)
+            if con_time.ndim == 2:
+                con_time = con_time.flatten()
+            
+            # Use mask to filter valid events, then filter non-zero times
+            valid_mask = (mask > 0) if mask is not None else np.ones(len(con_time), dtype=bool)
+            valid_times = con_time[valid_mask]
+            
+            # Filter out padding values (0 or negative)
+            valid_times = valid_times[valid_times > 0]
+            
+            if len(valid_times) > 0:
+                train_times.extend(valid_times.tolist())
+        
+        if len(train_times) == 0:
+            logger.warning("No valid time values found! Using default statistics.")
+            mean_log_time = 0.0
+            std_log_time = 1.0
+            num_samples = 0
+        else:
+            train_times = np.array(train_times)
+            mean_log_time = float(np.mean(train_times))
+            std_log_time = float(np.std(train_times))
+            num_samples = len(train_times)
+            
+            logger.info(f"Time statistics computed: mean={mean_log_time:.6f}, std={std_log_time:.6f}")
+            logger.info(f"  Number of valid time values: {num_samples}")
+            logger.info(f"  Time range: [{np.min(train_times):.4f}, {np.max(train_times):.4f}]")
+        
+        # Save time statistics to checkpoint directory
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        time_stats = {
+            'mean_log_time': mean_log_time,
+            'std_log_time': std_log_time,
+            'num_samples': num_samples
+        }
+        time_stats_path = os.path.join(args.checkpoint_dir, 'time_stats.json')
+        with open(time_stats_path, 'w') as f:
+            json.dump(time_stats, f, indent=2)
+        
+        logger.info(f"Saved time statistics to {time_stats_path}")
+    else:
+        # For non-rank-0 processes, set default values (will be loaded from file if needed)
+        mean_log_time = 0.0
+        std_log_time = 1.0
+        time_stats = {'mean_log_time': mean_log_time, 'std_log_time': std_log_time}
+    
     # Create model
     logger.info("Creating model...")
     model = EHRDiffusionModel(
@@ -318,13 +385,16 @@ def main():
         'project_name': args.project_name,
         'run_name': args.run_name,
         'obs_window': args.obs_window,
+        'vocab_size': train_dataset.vocab_size,
         'event_dim': args.event_dim,
         'time_dim': args.time_dim,
         'hidden_dim': args.hidden_dim,
         'num_layers': args.num_layers,
         'num_heads': args.num_heads,
         'timesteps': args.timesteps,
-        'beta_schedule': args.beta_schedule
+        'beta_schedule': args.beta_schedule,
+        'mean_log_time': mean_log_time,
+        'std_log_time': std_log_time
     }
     
     # Create trainer
@@ -338,7 +408,8 @@ def main():
         device=device,
         use_wandb=args.use_wandb and (rank == 0),
         rank=rank,
-        world_size=world_size
+        world_size=world_size,
+        scheduler=scheduler
     )
     
     # Resume from checkpoint if specified

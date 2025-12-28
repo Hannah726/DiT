@@ -23,8 +23,11 @@ def extract(a, t, x_shape):
         Extracted values with proper broadcasting shape
     """
     batch_size = t.shape[0]
-    out = a.gather(-1, t.cpu()).float()
-    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+    # Ensure a and t are on the same device
+    # a is a registered buffer, so it should already be on the correct device
+    # t should already be on the correct device from the caller
+    out = a.gather(-1, t).float()
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
 
 
 class GaussianDiffusion(nn.Module):

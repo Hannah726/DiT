@@ -56,11 +56,13 @@ class EHRDiffusionTrainer:
         device: str = 'cuda',
         use_wandb: bool = True,
         rank: int = 0,
-        world_size: int = 1
+        world_size: int = 1,
+        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
     ):
         self.model = model
         self.diffusion = diffusion
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config or {}
@@ -233,10 +235,16 @@ class EHRDiffusionTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
         
+        # Update learning rate scheduler
+        if self.scheduler is not None:
+            self.scheduler.step()
+        
         # Metrics
+        current_lr = self.optimizer.param_groups[0]['lr']
         metrics = {
             'diffusion_loss': diff_loss.item(),
             'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else 0.0,
+            'lr': current_lr,
         }
         
         # Decode for monitoring (optional, only for logging)
@@ -414,13 +422,3 @@ class EHRDiffusionTrainer:
         
         if self.use_wandb:
             wandb.finish()
-
-
-# Quick test
-if __name__ == '__main__':
-    print("=" * 60)
-    print("Testing EHRDiffusionTrainer")
-    print("=" * 60)
-    
-    print("Note: This is a structural test. Full training requires complete model.")
-    print("Trainer class initialized successfully!")
