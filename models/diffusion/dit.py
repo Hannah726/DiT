@@ -146,6 +146,92 @@ class DiTBlock(nn.Module):
         return x
 
 
+class PromptCrossAttentionBlock(nn.Module):
+    """
+    DiT Block with Prompt Cross-Attention
+    
+    Architecture:
+        1. Self-attention on latent events (events attend to events)
+        2. Cross-attention to prompts (events attend to prompts) 
+        3. Feed-forward network
+    
+    All with adaptive layer normalization conditioned on timestep + demographics
+    """
+    
+    def __init__(
+        self,
+        hidden_dim,
+        num_heads,
+        condition_dim,
+        mlp_ratio=4.0,
+        dropout=0.1
+    ):
+        super().__init__()
+        
+        self.norm1 = AdaptiveLayerNorm(hidden_dim, condition_dim)
+        self.self_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.norm_cross = AdaptiveLayerNorm(hidden_dim, condition_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.norm2 = AdaptiveLayerNorm(hidden_dim, condition_dim)
+        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, hidden_dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x, c, prompts=None, mask=None):
+        """
+        Args:
+            x: (B, N, D) - latent event sequence
+            c: (B, C) - condition embedding (timestep + demographics)
+            prompts: (B, P, D) - prompt tokens from AdaptivePromptGenerator
+            mask: (B, N) - valid event mask
+        
+        Returns:
+            (B, N, D) - updated latent sequence
+        """
+        x_norm = self.norm1(x, c)
+        
+        attn_mask = None
+        if mask is not None:
+            attn_mask = ~mask.bool()
+        
+        self_attn_out, _ = self.self_attn(
+            x_norm, x_norm, x_norm, 
+            key_padding_mask=attn_mask
+        )
+        x = x + self_attn_out
+        
+        if prompts is not None:
+            x_norm_cross = self.norm_cross(x, c)
+            
+            cross_attn_out, _ = self.cross_attn(
+                x_norm_cross,
+                prompts,
+                prompts
+            )
+            x = x + cross_attn_out
+        
+        x = x + self.mlp(self.norm2(x, c))
+        
+        return x
+
+
 class DiT(nn.Module):
     """
     Diffusion Transformer for EHR Latent Denoising
@@ -157,6 +243,8 @@ class DiT(nn.Module):
         num_heads: Number of attention heads
         condition_dim: Dimension of conditioning (demographics)
         dropout: Dropout rate
+        mlp_ratio: MLP hidden dimension ratio
+        use_prompts: Whether to use prompt cross-attention
     """
     
     def __init__(
@@ -167,43 +255,52 @@ class DiT(nn.Module):
         num_heads: int = 8,
         condition_dim: int = 2,
         dropout: float = 0.1,
-        mlp_ratio: float = 4.0
+        mlp_ratio: float = 4.0,
+        use_prompts: bool = False
     ):
         super().__init__()
         
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.use_prompts = use_prompts
         
-        # Input projection
         self.input_proj = nn.Linear(latent_dim, hidden_dim)
         
-        # Timestep embedding
         self.time_embedder = TimestepEmbedder(hidden_dim)
         
-        # Condition embedding (demographics)
         self.condition_embedder = nn.Sequential(
             nn.Linear(condition_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # Combined condition dimension (time + demographics)
         combined_condition_dim = hidden_dim
         
-        # Positional embedding for events
         self.pos_embedding = nn.Parameter(torch.randn(1, 256, hidden_dim) * 0.02)
         
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            DiTBlock(
-                hidden_dim,
-                num_heads,
-                combined_condition_dim,
-                mlp_ratio=mlp_ratio,
-                dropout=dropout
-            )
-            for _ in range(num_layers)
-        ])
+        if use_prompts:
+            self.prompt_proj = nn.Linear(latent_dim, hidden_dim)
+            self.blocks = nn.ModuleList([
+                PromptCrossAttentionBlock(
+                    hidden_dim,
+                    num_heads,
+                    combined_condition_dim,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout
+                )
+                for _ in range(num_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                DiTBlock(
+                    hidden_dim,
+                    num_heads,
+                    combined_condition_dim,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout
+                )
+                for _ in range(num_layers)
+            ])
         
         # Output projection
         self.final_norm = nn.LayerNorm(hidden_dim)
@@ -223,12 +320,13 @@ class DiT(nn.Module):
             if module.weight is not None:
                 nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, x, t, condition=None, mask=None):
+    def forward(self, x, t, condition=None, prompts=None, mask=None):
         """
         Args:
             x: (B, N, latent_dim) - noisy latent codes
             t: (B,) - timestep indices
             condition: (B, condition_dim) - demographics
+            prompts: (B, P, latent_dim) - adaptive prompts
             mask: (B, N) - valid event mask
             
         Returns:
@@ -236,29 +334,27 @@ class DiT(nn.Module):
         """
         B, N, _ = x.shape
         
-        # Project input to hidden dimension
-        x = self.input_proj(x)  # (B, N, hidden_dim)
-        
-        # Add positional embeddings
+        x = self.input_proj(x)
         x = x + self.pos_embedding[:, :N, :]
         
-        # Embed timestep
-        t_emb = self.time_embedder(t)  # (B, hidden_dim)
+        t_emb = self.time_embedder(t)
         
-        # Embed condition (demographics)
         if condition is not None:
-            c_emb = self.condition_embedder(condition)  # (B, hidden_dim)
-            # Combine time and condition
+            c_emb = self.condition_embedder(condition)
             c = t_emb + c_emb
         else:
             c = t_emb
         
-        # Apply transformer blocks
-        for block in self.blocks:
-            x = block(x, c, mask=mask)
+        if self.use_prompts and prompts is not None:
+            prompts = self.prompt_proj(prompts)
         
-        # Final normalization and projection
+        for block in self.blocks:
+            if self.use_prompts:
+                x = block(x, c, prompts=prompts, mask=mask)
+            else:
+                x = block(x, c, mask=mask)
+        
         x = self.final_norm(x)
-        x = self.output_proj(x)  # (B, N, latent_dim)
+        x = self.output_proj(x)
         
         return x

@@ -174,7 +174,7 @@ class GaussianDiffusion(nn.Module):
         
         return x_start
     
-    def p_mean_variance(self, model, x_t, t, condition=None, mask=None):
+    def p_mean_variance(self, model, x_t, t, condition=None, prompts=None, mask=None):
         """
         Predict mean and variance for reverse process p(x_{t-1} | x_t)
         
@@ -183,6 +183,7 @@ class GaussianDiffusion(nn.Module):
             x_t: (B, N, D) - noisy latent
             t: (B,) - timestep
             condition: Optional conditioning (e.g., demographics)
+            prompts: Optional prompt tokens
             mask: (B, N) - valid event mask
             
         Returns:
@@ -191,7 +192,7 @@ class GaussianDiffusion(nn.Module):
             model_log_variance: (B, N, D)
         """
         # Predict noise
-        predicted_noise = model(x_t, t, condition=condition, mask=mask)
+        predicted_noise = model(x_t, t, condition=condition, prompts=prompts, mask=mask)
         
         # Predict x_0
         x_start = self.predict_start_from_noise(x_t, t, predicted_noise)
@@ -204,7 +205,7 @@ class GaussianDiffusion(nn.Module):
         return model_mean, model_variance, model_log_variance
     
     @torch.no_grad()
-    def p_sample(self, model, x_t, t, condition=None, mask=None):
+    def p_sample(self, model, x_t, t, condition=None, prompts=None, mask=None):
         """
         Single reverse diffusion step: sample x_{t-1} from p(x_{t-1} | x_t)
         
@@ -213,13 +214,14 @@ class GaussianDiffusion(nn.Module):
             x_t: (B, N, D) - noisy latent
             t: (B,) - timestep
             condition: Optional conditioning
+            prompts: Optional prompt tokens
             mask: (B, N) - valid event mask
             
         Returns:
             x_{t-1}: (B, N, D) - less noisy latent
         """
         model_mean, _, model_log_variance = self.p_mean_variance(
-            model, x_t, t, condition=condition, mask=mask
+            model, x_t, t, condition=condition, prompts=prompts, mask=mask
         )
         
         noise = torch.randn_like(x_t)
@@ -230,7 +232,7 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
     
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, condition=None, mask=None, return_all_steps=False):
+    def p_sample_loop(self, model, shape, condition=None, prompts=None, mask=None, return_all_steps=False):
         """
         Full reverse diffusion process: generate x_0 from x_T
         
@@ -238,6 +240,7 @@ class GaussianDiffusion(nn.Module):
             model: Denoising model
             shape: (B, N, D) - shape of samples to generate
             condition: Optional conditioning
+            prompts: Optional prompt tokens
             mask: (B, N) - valid event mask
             return_all_steps: Whether to return intermediate steps
             
@@ -255,7 +258,7 @@ class GaussianDiffusion(nn.Module):
         
         for i in reversed(range(self.timesteps)):
             t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            x = self.p_sample(model, x, t, condition=condition, mask=mask)
+            x = self.p_sample(model, x, t, condition=condition, prompts=prompts, mask=mask)
             
             if return_all_steps:
                 all_steps.append(x)
@@ -264,7 +267,7 @@ class GaussianDiffusion(nn.Module):
             return x, all_steps
         return x
     
-    def training_losses(self, model, x_start, t, condition=None, mask=None, noise=None):
+    def training_losses(self, model, x_start, t, condition=None, prompts=None, mask=None, noise=None):
         """
         Compute training loss for denoising
         
@@ -273,6 +276,7 @@ class GaussianDiffusion(nn.Module):
             x_start: (B, N, D) - clean latent codes
             t: (B,) - timestep indices
             condition: Optional conditioning
+            prompts: Optional prompt tokens
             mask: (B, N) - valid event mask
             noise: Optional pre-sampled noise
             
@@ -287,7 +291,7 @@ class GaussianDiffusion(nn.Module):
         x_t = self.q_sample(x_start, t, noise=noise)
         
         # Predict noise
-        predicted_noise = model(x_t, t, condition=condition, mask=mask)
+        predicted_noise = model(x_t, t, condition=condition, prompts=prompts, mask=mask)
         
         # Compute MSE loss
         if mask is not None:

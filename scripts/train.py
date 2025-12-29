@@ -112,7 +112,10 @@ def parse_args():
                        help='Use distributed training')
     parser.add_argument('--local_rank', type=int, default=0,
                        help='Local rank for distributed training')
-    
+
+    parser.add_argument('--use_prompts', action='store_true',
+                    help='Use adaptive prompt conditioning (demographics-based)')
+
     return parser.parse_args()
 
 
@@ -338,7 +341,8 @@ def main():
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
-        dropout=args.dropout
+        dropout=args.dropout,
+        use_prompts=args.use_prompts
     )
     
     model = model.to(device)
@@ -348,7 +352,12 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {total_params:,}")
     logger.info(f"Trainable parameters: {trainable_params:,}")
-    
+
+    if args.use_prompts:
+        prompt_params = model.prompt_generator.get_num_parameters()
+        logger.info(f"Prompt generator parameters: {prompt_params:,}")
+        logger.info(f"Number of prompts per patient: {model.prompt_generator.get_num_prompts()}")
+
     # Wrap with DDP
     if args.distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -394,7 +403,7 @@ def main():
         'timesteps': args.timesteps,
         'beta_schedule': args.beta_schedule,
         'mean_log_time': mean_log_time,
-        'std_log_time': std_log_time
+        'use_prompts': args.use_prompts
     }
     
     # Create trainer

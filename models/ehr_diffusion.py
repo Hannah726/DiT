@@ -13,6 +13,7 @@ from models.conditioning.demographic_encoder import DemographicEncoder
 from models.diffusion.dit import DiT
 from models.decoder.event_decoder import EventDecoder
 from models.decoder.time_decoder import TimeDecoder
+from models.prompts.adaptive_prompts import AdaptivePromptGenerator
 
 
 class EHRDiffusionModel(nn.Module):
@@ -40,6 +41,7 @@ class EHRDiffusionModel(nn.Module):
         demographic_dim: Input demographic dimension
         dropout: Dropout rate
         max_token_len: Maximum tokens per event
+        use_prompts: Whether to use adaptive prompt conditioning
     """
     
     def __init__(
@@ -54,7 +56,8 @@ class EHRDiffusionModel(nn.Module):
         num_heads: int = 8,
         demographic_dim: int = 2,
         dropout: float = 0.1,
-        max_token_len: int = 128
+        max_token_len: int = 128,
+        use_prompts: bool = False
     ):
         super().__init__()
         
@@ -62,6 +65,7 @@ class EHRDiffusionModel(nn.Module):
         self.event_dim = event_dim
         self.time_dim = time_dim
         self.latent_dim = event_dim + time_dim
+        self.use_prompts = use_prompts
         
         # 1. Structured Event Encoder
         self.encoder = StructuredEventEncoder(
@@ -96,18 +100,29 @@ class EHRDiffusionModel(nn.Module):
             dropout=dropout,
             use_embedding=False
         )
+
+        # 4. Adaptive Prompt Generator
+        if use_prompts:
+            self.prompt_generator = AdaptivePromptGenerator(
+                demographic_dim=demographic_dim,
+                num_global_prompts=32,
+                num_demographic_prompts=8,
+                prompt_dim=self.latent_dim,  # Must match joint latent dim
+                dropout=dropout
+            )
         
-        # 4. Diffusion Transformer (DiT)
+        # 5. Diffusion Transformer (DiT)
         self.dit = DiT(
             latent_dim=self.latent_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
             condition_dim=demographic_dim,
-            dropout=dropout
+            dropout=dropout,
+            use_prompts=use_prompts
         )
         
-        # 5. Event Decoder
+        # 6. Event Decoder
         self.decoder = EventDecoder(
             event_dim=event_dim,
             hidden_dim=256,
@@ -120,7 +135,7 @@ class EHRDiffusionModel(nn.Module):
             dropout=dropout
         )
         
-        # 6. Time Decoder
+        # 7. Time Decoder
         self.time_decoder = TimeDecoder(
             time_dim=time_dim,
             hidden_dim=128,

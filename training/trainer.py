@@ -61,6 +61,9 @@ class EHRDiffusionTrainer:
     ):
         self.model = model
         self.diffusion = diffusion
+        
+        # Helper to get actual model (unwrap DDP if needed)
+        self._get_model = lambda: model.module if isinstance(model, DDP) else model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.train_loader = train_loader
@@ -174,11 +177,16 @@ class EHRDiffusionTrainer:
         
         with autocast(enabled=self.use_amp):
             # Encode events and time
-            event_latents = self.model.encoder(input_ids, type_ids, dpe_ids)  # (B, N, event_dim)
-            time_emb = self.model.time_encoder(con_time)  # (B, N, time_dim)
-            
+            model = self._get_model()
+            event_latents = model.encoder(input_ids, type_ids, dpe_ids)  # (B, N, event_dim)
+            time_emb = model.time_encoder(con_time)  # (B, N, time_dim)
             # Joint latent
             joint_latent = torch.cat([event_latents, time_emb], dim=-1)  # (B, N, latent_dim)
+
+            # Generate prompts if using prompts
+            prompts = None
+            if hasattr(model, 'use_prompts') and model.use_prompts:
+                prompts = model.prompt_generator(demographics)
             
             # Sample timesteps
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
@@ -188,8 +196,10 @@ class EHRDiffusionTrainer:
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
             
             # Predict noise - DiT handles demographics encoding internally via condition_embedder
-            # demographics: (B, 2) -> DiT condition_embedder -> (B, hidden_dim)
-            predicted_noise = self.model.dit(noisy_latent, t, condition=demographics, mask=mask)
+            predicted_noise = model.dit(
+                noisy_latent, t, 
+                prompts=prompts,
+                condition=demographics, mask=mask)
             
             # Compute diffusion loss
             if mask is not None:
@@ -208,7 +218,8 @@ class EHRDiffusionTrainer:
                 token_mask = (input_ids.sum(dim=-1) > 0).float()  # (B, N)
                 token_mask_expanded = token_mask.unsqueeze(-1).expand(-1, -1, L)  # (B, N, L)
                 
-                recon_loss, _ = self.model.decoder.compute_reconstruction_loss(
+                model = self._get_model()
+                recon_loss, _ = model.decoder.compute_reconstruction_loss(
                     event_latents,
                     input_ids,
                     type_ids,
@@ -252,7 +263,8 @@ class EHRDiffusionTrainer:
         if self.global_step % (self.log_interval * 10) == 0:  # Less frequent to save compute
             with torch.no_grad():
                 # Decode joint latent to get events and time
-                decoded_events, decoded_time = self.model.decode_joint_latent(
+                model = self._get_model()
+                decoded_events, decoded_time = model.decode_joint_latent(
                     joint_latent,
                     return_logits=False,
                     denormalize_time=False  # Keep log-normalized for consistency
@@ -299,9 +311,15 @@ class EHRDiffusionTrainer:
             B, N, L = input_ids.shape
             
             # Encode
-            event_latents = self.model.encoder(input_ids, type_ids, dpe_ids)
-            time_emb = self.model.time_encoder(con_time)
+            model = self._get_model()
+            event_latents = model.encoder(input_ids, type_ids, dpe_ids)
+            time_emb = model.time_encoder(con_time)
             joint_latent = torch.cat([event_latents, time_emb], dim=-1)
+            
+            # Generate prompts if using prompts
+            prompts = None
+            if hasattr(model, 'use_prompts') and model.use_prompts:
+                prompts = model.prompt_generator(demographics)
             
             # Sample timesteps
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
@@ -311,7 +329,10 @@ class EHRDiffusionTrainer:
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
             
             # Predict noise - DiT will handle demographics encoding internally
-            predicted_noise = self.model.dit(noisy_latent, t, condition=demographics, mask=mask)
+            predicted_noise = model.dit(
+                noisy_latent, t, 
+                prompts=prompts,
+                condition=demographics, mask=mask)
             
             if mask is not None:
                 mask_expanded = mask.unsqueeze(-1)
@@ -336,10 +357,13 @@ class EHRDiffusionTrainer:
         if self.rank != 0:
             return
         
+        # Get actual model (unwrap DDP if needed) for saving
+        model_to_save = self._get_model()
+        
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': self.config
@@ -347,6 +371,9 @@ class EHRDiffusionTrainer:
         
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+        
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
         # Save regular checkpoint
         checkpoint_path = os.path.join(
@@ -365,9 +392,15 @@ class EHRDiffusionTrainer:
         """
         Load model checkpoint
         """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+        
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Get actual model (unwrap DDP if needed) for loading
+        model_to_load = self._get_model()
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+        
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
@@ -376,7 +409,10 @@ class EHRDiffusionTrainer:
         if self.scaler is not None and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
-        print(f"Loaded checkpoint from epoch {self.epoch}")
+        if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        print(f"Loaded checkpoint from epoch {self.epoch}, step {self.global_step}")
     
     def train(self):
         """
@@ -386,7 +422,8 @@ class EHRDiffusionTrainer:
         print(f"Device: {self.device}")
         print(f"Rank: {self.rank}/{self.world_size}")
         
-        for epoch in range(self.epoch, self.epochs):
+        start_epoch = self.epoch + 1 if self.global_step > 0 else self.epoch
+        for epoch in range(start_epoch, self.epochs):
             self.epoch = epoch
             
             # Train epoch

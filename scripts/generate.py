@@ -62,11 +62,17 @@ def generate_batch(model, diffusion, demographics, num_events, device):
     shape = (B, num_events, model.latent_dim)
     mask = torch.ones(B, num_events, device=device)
     
+    # Generate prompts if using prompts
+    prompts = None
+    if hasattr(model, 'use_prompts') and model.use_prompts:
+        prompts = model.prompt_generator(demographics)
+    
     # Reverse diffusion
     clean_latent = diffusion.p_sample_loop(
         model.dit,
         shape,
         condition=demographics,
+        prompts=prompts,
         mask=mask,
         return_all_steps=False
     )
@@ -105,7 +111,8 @@ def main():
         hidden_dim=config['hidden_dim'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
-        dropout=0.0  # No dropout during inference
+        dropout=0.0,  # No dropout during inference
+        use_prompts=config.get('use_prompts', False)
     )
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
