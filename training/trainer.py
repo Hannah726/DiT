@@ -350,9 +350,13 @@ class EHRDiffusionTrainer:
         
         return val_loss
     
-    def save_checkpoint(self, is_best=False):
+    def save_checkpoint(self, is_best=False, save_epoch_file=True):
         """
         Save model checkpoint
+        
+        Args:
+            is_best: Whether this is the best checkpoint so far
+            save_epoch_file: Whether to save a checkpoint file with epoch number
         """
         if self.rank != 0:
             return
@@ -375,12 +379,14 @@ class EHRDiffusionTrainer:
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
-        # Save regular checkpoint
-        checkpoint_path = os.path.join(
-            self.checkpoint_dir,
-            f'checkpoint_epoch_{self.epoch}.pt'
-        )
-        torch.save(checkpoint, checkpoint_path)
+        # Save regular checkpoint (only if save_epoch_file is True)
+        if save_epoch_file:
+            checkpoint_path = os.path.join(
+                self.checkpoint_dir,
+                f'checkpoint_epoch_{self.epoch}.pt'
+            )
+            torch.save(checkpoint, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
         
         # Save best checkpoint
         if is_best:
@@ -448,11 +454,17 @@ class EHRDiffusionTrainer:
                 if is_best:
                     self.best_val_loss = val_loss
                 
-                if epoch % self.save_interval == 0 or is_best:
-                    self.save_checkpoint(is_best=is_best)
+                # Save checkpoint: only save epoch file at save_interval, but always update best if improved
+                # Note: epoch is 0-indexed, so (epoch + 1) % save_interval == 0 means save at the 10th, 20th, etc. epoch
+                # Also save at epoch 0 (the first epoch)
+                save_epoch_file = (epoch == 0 or (epoch + 1) % self.save_interval == 0)
+                if save_epoch_file or is_best:
+                    self.save_checkpoint(is_best=is_best, save_epoch_file=save_epoch_file)
             else:
                 # Save without validation
-                if epoch % self.save_interval == 0:
+                # Note: epoch is 0-indexed, so (epoch + 1) % save_interval == 0 means save at the 10th, 20th, etc. epoch
+                # Also save at epoch 0 (the first epoch)
+                if epoch == 0 or (epoch + 1) % self.save_interval == 0:
                     self.save_checkpoint()
         
         print("Training completed!")
