@@ -12,10 +12,10 @@ class SimpleBoundaryPredictor(nn.Module):
     """
     Simple Boundary (Length) Predictor
     
-    Predicts: P(length | boundary_latent) for each event
+    Predicts: P(length | event_refined) for each event
     
     Args:
-        boundary_dim: Boundary latent dimension (from joint latent)
+        input_dim: Input dimension (event_refined dimension, typically pattern_dim)
         hidden_dim: MLP hidden dimension
         max_len: Maximum sequence length
         dropout: Dropout rate
@@ -23,19 +23,19 @@ class SimpleBoundaryPredictor(nn.Module):
     
     def __init__(
         self,
-        boundary_dim: int = 16,
-        hidden_dim: int = 64,
+        input_dim: int = 96,  # Changed from boundary_dim to input_dim (pattern_dim)
+        hidden_dim: int = 128,
         max_len: int = 128,
         dropout: float = 0.1
     ):
         super().__init__()
         
-        self.boundary_dim = boundary_dim
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.max_len = max_len
         
         self.predictor = nn.Sequential(
-            nn.Linear(boundary_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -59,16 +59,16 @@ class SimpleBoundaryPredictor(nn.Module):
             if module.weight is not None:
                 nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, boundary_latent):
+    def forward(self, event_refined):
         """
         Args:
-            boundary_latent: (B, N, boundary_dim) - boundary latent from denoised
+            event_refined: (B, N, input_dim) - refined event latents (from PatternDiscoveryPrompts)
         
         Returns:
             length_logits: (B, N, max_len+1) - raw logits
             length_dist: (B, N, max_len+1) - probability distribution
         """
-        length_logits = self.predictor(boundary_latent)
+        length_logits = self.predictor(event_refined)
         length_dist = F.softmax(length_logits, dim=-1)
         
         return length_logits, length_dist

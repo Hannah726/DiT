@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from data.dataset import EHRDiffusionDataset, EHRCollator
 from models.ehr_diffusion import EHRDiffusionModel
-from models.diffusion.gaussian_diffusion import GaussianDiffusion
+from models.gaussian_diffusion import GaussianDiffusion, TimeAwareGaussianDiffusion
 from training.trainer import EHRDiffusionTrainer
 from utils.logger import setup_logger
 
@@ -297,18 +297,21 @@ def main():
     logger.info(f"Pattern prompts parameters: {prompt_params:,}")
     logger.info(f"Number of learnable prompts: {args.num_prompts}")
     
-    # Wrap with DDP
-    if args.distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-    
-    # Create diffusion
-    diffusion = GaussianDiffusion(
+    # Create time-aware diffusion (reduced noise for time component)
+    # Get pattern_dim from model (before DDP wrapping)
+    diffusion = TimeAwareGaussianDiffusion(
+        pattern_dim=model.pattern_dim,  # 96
+        time_noise_scale=0.5,  # Reduce time noise by 50%
         timesteps=args.timesteps,
         beta_schedule=args.beta_schedule,
         beta_start=args.beta_start,
         beta_end=args.beta_end
     )
     diffusion = diffusion.to(device)
+    
+    # Wrap with DDP
+    if args.distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     # Create optimizer
     optimizer = create_optimizer(model, args)

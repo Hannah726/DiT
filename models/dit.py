@@ -235,7 +235,7 @@ class DiT(nn.Module):
         - Prompts guide denoising process with learned patterns
     
     Args:
-        latent_dim: Dimension of input latent (event_dim + time_dim + boundary_dim)
+        latent_dim: Dimension of input latent (event_refined + time_refined, NO boundary)
         hidden_dim: Hidden dimension of transformer
         num_layers: Number of transformer layers
         num_heads: Number of attention heads
@@ -247,7 +247,7 @@ class DiT(nn.Module):
     
     def __init__(
         self,
-        latent_dim: int = 208,  # 96 (event) + 96 (time) + 16 (boundary)
+        latent_dim: int = 192,  # 96 (event_refined) + 96 (time_refined), NO boundary
         hidden_dim: int = 512,
         num_layers: int = 12,
         num_heads: int = 8,

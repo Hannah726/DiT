@@ -308,3 +308,101 @@ class GaussianDiffusion(nn.Module):
         }
         
         return loss, loss_dict
+
+
+class TimeAwareGaussianDiffusion(GaussianDiffusion):
+    """
+    Time-Aware Gaussian Diffusion with reduced noise for time component
+    
+    This class extends GaussianDiffusion to apply smaller noise to the time
+    component of the joint latent space, protecting time information during
+    the diffusion process.
+    
+    Args:
+        pattern_dim: Dimension of event_refined (and time_refined)
+                     Joint latent is [event_refined, time_refined] = [pattern_dim, pattern_dim]
+        time_noise_scale: Scale factor for time noise (default: 0.5)
+                          Smaller values = less noise for time component
+        **kwargs: All arguments from GaussianDiffusion
+    """
+    
+    def __init__(self, pattern_dim: int = 96, time_noise_scale: float = 0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.pattern_dim = pattern_dim
+        self.time_noise_scale = time_noise_scale
+    
+    def q_sample(self, x_start, t, noise=None, return_noise=False):
+        """
+        Forward diffusion process with reduced noise for time component
+        
+        Args:
+            x_start: (B, N, D) - clean latent codes [event_refined, time_refined]
+            t: (B,) - timestep indices
+            noise: (B, N, D) - optional pre-sampled noise
+            return_noise: If True, return the actual noise used (scaled for time)
+            
+        Returns:
+            x_t: (B, N, D) - noisy latent codes
+            (optional) actual_noise: (B, N, D) - the actual noise used (if return_noise=True)
+        """
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        
+        # Split noise into event and time parts
+        # Joint latent structure: [event_refined (pattern_dim), time_refined (pattern_dim)]
+        event_noise = noise[..., :self.pattern_dim]
+        time_noise = noise[..., self.pattern_dim:] * self.time_noise_scale  # Reduced noise for time
+        
+        # Recombine with scaled time noise
+        actual_noise = torch.cat([event_noise, time_noise], dim=-1)
+        
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        
+        x_t = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * actual_noise
+        
+        if return_noise:
+            return x_t, actual_noise
+        return x_t
+    
+    def training_losses(self, model, x_start, t, condition=None, prompts=None, mask=None, noise=None):
+        """
+        Compute training loss for denoising with time-aware noise scaling
+        
+        Args:
+            model: Denoising model
+            x_start: (B, N, D) - clean latent codes
+            t: (B,) - timestep indices
+            condition: Optional conditioning
+            prompts: Optional prompt tokens
+            mask: (B, N) - valid event mask
+            noise: Optional pre-sampled noise
+            
+        Returns:
+            loss: Scalar MSE loss
+            loss_dict: Dictionary of loss components
+        """
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        
+        # Forward diffusion with time-aware noise scaling
+        x_t, actual_noise = self.q_sample(x_start, t, noise=noise, return_noise=True)
+        
+        # Predict noise
+        predicted_noise = model(x_t, t, condition=condition, prompts=prompts, mask=mask)
+        
+        # Compute MSE loss using actual_noise (scaled for time)
+        if mask is not None:
+            # Only compute loss on valid events
+            mask_expanded = mask.unsqueeze(-1)  # (B, N, 1)
+            loss = F.mse_loss(predicted_noise * mask_expanded, actual_noise * mask_expanded, reduction='sum')
+            loss = loss / mask.sum()
+        else:
+            loss = F.mse_loss(predicted_noise, actual_noise)
+        
+        loss_dict = {
+            'loss': loss.item(),
+            'mse': loss.item()
+        }
+        
+        return loss, loss_dict

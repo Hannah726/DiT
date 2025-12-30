@@ -25,10 +25,10 @@ class EHRDiffusionModel(nn.Module):
         1. StructuredEventEncoder: (token, type, dpe) -> event_latent (64)
         2. HybridTimeEncoder: log_time -> time_emb (32)
         3. PatternDiscoveryPrompts: (event, time) -> (event_refined, time_refined, prompts)
-        4. SimpleBoundaryPredictor: boundary_latent -> length_dist
-        5. Joint Latent: [event_refined, time_refined, boundary_emb] (208)
-        6. DiT: Denoising with prompt conditioning
-        7. Decoders: Reconstruct events, time, and boundary
+        4. SimpleBoundaryPredictor: event_refined -> length_dist (boundary NOT in diffusion)
+        5. Joint Latent: [event_refined, time_refined] (192) - NO boundary
+        6. DiT: Denoising with prompt conditioning (only event + time)
+        7. Decoders: Reconstruct events, time, and boundary (from denoised event)
     
     Args:
         vocab_size: Token vocabulary size
@@ -72,8 +72,8 @@ class EHRDiffusionModel(nn.Module):
         self.pattern_dim = pattern_dim
         self.use_prompts = use_prompts
         
-        self.boundary_dim = 16
-        self.latent_dim = pattern_dim + pattern_dim + self.boundary_dim
+        # Joint latent only contains event_refined + time_refined (no boundary)
+        self.latent_dim = pattern_dim + pattern_dim  # 96 + 96 = 192
         
         self.event_encoder = StructuredEventEncoder(
             vocab_sizes={
@@ -109,17 +109,17 @@ class EHRDiffusionModel(nn.Module):
             dropout=dropout
         )
         
+        # Boundary predictor now takes event_refined as input (not boundary_emb)
         self.boundary_predictor = SimpleBoundaryPredictor(
-            boundary_dim=self.boundary_dim,
+            input_dim=pattern_dim,  # Takes event_refined (pattern_dim) as input
             hidden_dim=128,
             max_len=max_token_len,
             dropout=dropout
         )
         
-        self.boundary_embedding = nn.Embedding(max_token_len + 1, self.boundary_dim)
-        
+        # DiT now only processes event_refined + time_refined (no boundary)
         self.dit = DiT(
-            latent_dim=self.latent_dim,
+            latent_dim=self.latent_dim,  # 192 (event + time only)
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
@@ -159,7 +159,7 @@ class EHRDiffusionModel(nn.Module):
             event_mask: (B, N, L) - valid token mask
         
         Returns:
-            joint_latent: (B, N, 208) - [event_refined, time_refined, boundary_emb]
+            joint_latent: (B, N, 192) - [event_refined, time_refined] (NO boundary)
             event_refined: (B, N, 96)
             time_refined: (B, N, 96)
             prompt_weights: (B, N, K)
@@ -187,12 +187,11 @@ class EHRDiffusionModel(nn.Module):
         else:
             true_length = (input_ids > 0).sum(dim=-1).long()
         
-        boundary_emb = self.boundary_embedding(true_length)
-        
+        # Joint latent only contains event_refined + time_refined
+        # Boundary is NOT included in diffusion process
         joint_latent = torch.cat([
             event_refined,
-            time_refined,
-            boundary_emb
+            time_refined
         ], dim=-1)
         
         return joint_latent, event_refined, time_refined, prompt_weights, true_length
@@ -227,18 +226,18 @@ class EHRDiffusionModel(nn.Module):
         """
         return self.time_decoder(time_emb)
     
-    def predict_boundary(self, boundary_latent):
+    def predict_boundary(self, event_refined):
         """
-        Predict boundary (length) distribution
+        Predict boundary (length) distribution from event_refined
         
         Args:
-            boundary_latent: (B, N, 16) - boundary latent from denoised
+            event_refined: (B, N, pattern_dim) - refined event latents
         
         Returns:
             length_logits: (B, N, max_len+1)
             length_dist: (B, N, max_len+1)
         """
-        return self.boundary_predictor(boundary_latent)
+        return self.boundary_predictor(event_refined)
     
     def decode_joint_latent(self, joint_latent, return_logits=False, 
                            deterministic_boundary=True):
@@ -246,7 +245,7 @@ class EHRDiffusionModel(nn.Module):
         Decode joint latent to events, time, and boundary
         
         Args:
-            joint_latent: (B, N, 208) - denoised joint latent
+            joint_latent: (B, N, 192) - denoised joint latent (event + time only)
             return_logits: Whether to return logits for events
             deterministic_boundary: Use argmax for boundary (vs sampling)
         
@@ -256,11 +255,12 @@ class EHRDiffusionModel(nn.Module):
             predicted_length: (B, N)
             boundary_mask: (B, N, L)
         """
+        # Split joint latent (no boundary in it anymore)
         event_latent = joint_latent[..., :self.pattern_dim]
         time_latent = joint_latent[..., self.pattern_dim:2*self.pattern_dim]
-        boundary_latent = joint_latent[..., 2*self.pattern_dim:]
         
-        length_logits, length_dist = self.predict_boundary(boundary_latent)
+        # Predict boundary from denoised event_latent
+        length_logits, length_dist = self.predict_boundary(event_latent)
         
         predicted_length = self.boundary_predictor.sample_length(
             length_dist,

@@ -100,31 +100,23 @@ class DDIMSampler:
         model = self.model.module if hasattr(self.model, 'module') else self.model
         
         # Start from pure noise
-        latent_dim = model.latent_dim  # 208
+        latent_dim = model.latent_dim  # 192 (event + time only, no boundary)
         shape = (batch_size, num_events, latent_dim)
         x = torch.randn(shape, device=self.device)
         
         # Create mask (all events valid)
         mask = torch.ones(batch_size, num_events, device=self.device, dtype=torch.bool)
         
-        # Generate prompts (if demographics provided)
+        # Generate prompts (consistent with training)
+        # Use learnable prompts directly, same as in training
         prompts = None
         condition = None
+        if model.use_prompts:
+            # Directly use learnable prompts (same as training)
+            prompts = model.pattern_prompts.prompts.unsqueeze(0).expand(batch_size, -1, -1)
+        
         if demographics is not None:
             demographics_tensor = torch.from_numpy(demographics).float().to(self.device)
-            
-            # Generate prompts via pattern discovery
-            # We need a "dummy" encoding to get prompts
-            # But in generation, we don't have real events yet
-            # Solution: Use demographics to generate prompts directly
-            # For now, use random event/time as proxy
-            dummy_event = torch.randn(batch_size, num_events, model.event_dim, device=self.device)
-            dummy_time = torch.randn(batch_size, num_events, model.time_dim, device=self.device)
-            
-            _, _, prompts = model.pattern_prompts(
-                dummy_event, dummy_time, mask=mask
-            )
-            
             condition = demographics_tensor
         
         # DDIM reverse diffusion

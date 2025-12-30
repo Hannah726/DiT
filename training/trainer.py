@@ -10,6 +10,7 @@ import wandb
 from typing import Optional
 
 from utils.logger import get_logger, MetricLogger
+from models.gaussian_diffusion import TimeAwareGaussianDiffusion
 
 
 class EHRDiffusionTrainer:
@@ -106,7 +107,12 @@ class EHRDiffusionTrainer:
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
             
             noise = torch.randn_like(joint_latent)
-            noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
+            # Get actual noise used (scaled for time if using TimeAwareGaussianDiffusion)
+            if isinstance(self.diffusion, TimeAwareGaussianDiffusion):
+                noisy_latent, actual_noise = self.diffusion.q_sample(joint_latent, t, noise=noise, return_noise=True)
+            else:
+                noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
+                actual_noise = noise
             
             event_level_mask = (event_mask.sum(dim=-1) > 0).float()
             
@@ -122,14 +128,22 @@ class EHRDiffusionTrainer:
                 mask=event_level_mask
             )
             
+            # Use actual_noise (scaled for time) for loss calculation
             diff_loss = F.mse_loss(
                 predicted_noise * event_level_mask.unsqueeze(-1),
-                noise * event_level_mask.unsqueeze(-1),
+                actual_noise * event_level_mask.unsqueeze(-1),
                 reduction='sum'
             ) / event_level_mask.sum()
             
-            boundary_latent = joint_latent[..., 2*model.pattern_dim:]
-            length_logits, _ = model.predict_boundary(boundary_latent)
+            # Boundary prediction from denoised latent (consistent with inference)
+            # Predict x_0 from noisy latent and predicted noise
+            predicted_x0 = self.diffusion.predict_start_from_noise(
+                noisy_latent, t, predicted_noise
+            )
+            # Extract event_latent from predicted_x0 (first pattern_dim dimensions)
+            predicted_event_latent = predicted_x0[..., :model.pattern_dim]
+            # Predict boundary from denoised event latent
+            length_logits, _ = model.predict_boundary(predicted_event_latent)
             
             boundary_loss = model.boundary_predictor.compute_loss(
                 length_logits,
@@ -139,12 +153,21 @@ class EHRDiffusionTrainer:
             
             recon_loss = 0.0
             if self.recon_weight > 0:
+                # Apply BAD constraint during training: create boundary_mask from true_length
+                B, N = true_length.shape
+                L = model.event_decoder.max_token_len
+                positions = torch.arange(L, device=self.device).unsqueeze(0).unsqueeze(0)
+                boundary_mask_train = (positions < true_length.unsqueeze(-1)).float()
+                
+                # Combine event_mask and boundary_mask for reconstruction loss
+                combined_mask = event_mask * boundary_mask_train
+                
                 event_recon_loss, _ = model.event_decoder.compute_reconstruction_loss(
                     event_refined,
                     input_ids,
                     type_ids,
                     dpe_ids,
-                    mask=event_mask
+                    mask=combined_mask  # Use combined mask with BAD constraint
                 )
                 
                 time_recon_loss, _ = model.time_decoder.compute_reconstruction_loss(
@@ -225,7 +248,12 @@ class EHRDiffusionTrainer:
         B = joint_latent.shape[0]
         t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
         noise = torch.randn_like(joint_latent)
-        noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
+        # Get actual noise used (scaled for time if using TimeAwareGaussianDiffusion)
+        if isinstance(self.diffusion, TimeAwareGaussianDiffusion):
+            noisy_latent, actual_noise = self.diffusion.q_sample(joint_latent, t, noise=noise, return_noise=True)
+        else:
+            noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
+            actual_noise = noise
         
         event_level_mask = (event_mask.sum(dim=-1) > 0).float()
         
@@ -241,14 +269,22 @@ class EHRDiffusionTrainer:
             mask=event_level_mask
         )
         
+        # Use actual_noise (scaled for time) for loss calculation
         diff_loss = F.mse_loss(
             predicted_noise * event_level_mask.unsqueeze(-1),
-            noise * event_level_mask.unsqueeze(-1),
+            actual_noise * event_level_mask.unsqueeze(-1),
             reduction='sum'
         ) / event_level_mask.sum()
         
-        boundary_latent = joint_latent[..., 2*model.pattern_dim:]
-        length_logits, _ = model.predict_boundary(boundary_latent)
+        # Boundary prediction from denoised latent (consistent with inference)
+        # Predict x_0 from noisy latent and predicted noise
+        predicted_x0 = self.diffusion.predict_start_from_noise(
+            noisy_latent, t, predicted_noise
+        )
+        # Extract event_latent from predicted_x0 (first pattern_dim dimensions)
+        predicted_event_latent = predicted_x0[..., :model.pattern_dim]
+        # Predict boundary from denoised event latent
+        length_logits, _ = model.predict_boundary(predicted_event_latent)
         
         boundary_loss = model.boundary_predictor.compute_loss(
             length_logits,
