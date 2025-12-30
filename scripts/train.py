@@ -1,6 +1,6 @@
 """
-Main training script for EHR Diffusion Model
-Supports single-GPU and multi-GPU distributed training
+Main training script for EHR Diffusion Model with Pattern Discovery
+Supports boundary prediction, prompt learning, and joint event-time modeling
 """
 
 import os
@@ -26,7 +26,7 @@ from utils.logger import setup_logger
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train EHR Diffusion Model')
+    parser = argparse.ArgumentParser(description='Train EHR Diffusion Model with Pattern Discovery')
     
     # Data arguments
     parser.add_argument('--data_dir', type=str, required=True,
@@ -40,9 +40,13 @@ def parse_args():
     
     # Model arguments
     parser.add_argument('--event_dim', type=int, default=64,
-                       help='Event latent dimension')
+                       help='Event latent dimension (from StructuredEventEncoder)')
     parser.add_argument('--time_dim', type=int, default=32,
-                       help='Time embedding dimension')
+                       help='Time embedding dimension (from HybridTimeEncoder)')
+    parser.add_argument('--pattern_dim', type=int, default=96,
+                       help='Pattern discovery hidden dimension')
+    parser.add_argument('--num_prompts', type=int, default=16,
+                       help='Number of learnable prompts (K)')
     parser.add_argument('--hidden_dim', type=int, default=512,
                        help='DiT hidden dimension')
     parser.add_argument('--num_layers', type=int, default=12,
@@ -76,8 +80,12 @@ def parse_args():
                        help='Gradient clipping value')
     parser.add_argument('--warmup_steps', type=int, default=1000,
                        help='Number of warmup steps')
-    parser.add_argument('--recon_weight', type=float, default=0.0,
-                       help='Reconstruction loss weight')
+    
+    # Loss weights
+    parser.add_argument('--boundary_weight', type=float, default=0.5,
+                       help='Boundary prediction loss weight')
+    parser.add_argument('--recon_weight', type=float, default=0.1,
+                       help='Reconstruction loss weight (optional)')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=4,
@@ -90,7 +98,7 @@ def parse_args():
     # Logging arguments
     parser.add_argument('--use_wandb', action='store_true',
                        help='Use Weights & Biases logging')
-    parser.add_argument('--project_name', type=str, default='ehr-diffusion',
+    parser.add_argument('--project_name', type=str, default='ehr-diffusion-patterns',
                        help='WandB project name')
     parser.add_argument('--run_name', type=str, default=None,
                        help='WandB run name')
@@ -113,16 +121,11 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=0,
                        help='Local rank for distributed training')
 
-    parser.add_argument('--use_prompts', action='store_true',
-                    help='Use adaptive prompt conditioning (demographics-based)')
-
     return parser.parse_args()
 
 
 def setup_distributed():
-    """
-    Setup for distributed training
-    """
+    """Setup for distributed training"""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
@@ -140,18 +143,13 @@ def setup_distributed():
 
 
 def cleanup_distributed():
-    """
-    Cleanup distributed training
-    """
+    """Cleanup distributed training"""
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def create_optimizer(model, args):
-    """
-    Create optimizer with weight decay
-    """
-    # Separate parameters with and without weight decay
+    """Create optimizer with weight decay"""
     decay_params = []
     no_decay_params = []
     
@@ -159,7 +157,7 @@ def create_optimizer(model, args):
         if not param.requires_grad:
             continue
         
-        # No weight decay for bias and LayerNorm
+        # No weight decay for bias, LayerNorm, and embeddings
         if 'bias' in name or 'norm' in name or 'embedding' in name:
             no_decay_params.append(param)
         else:
@@ -181,9 +179,7 @@ def create_optimizer(model, args):
 
 
 def create_scheduler(optimizer, args, num_training_steps):
-    """
-    Create learning rate scheduler with warmup
-    """
+    """Create learning rate scheduler with warmup"""
     from torch.optim.lr_scheduler import LambdaLR
     
     def lr_lambda(current_step):
@@ -268,81 +264,24 @@ def main():
     logger.info(f"Val dataset size: {len(val_dataset)}")
     logger.info(f"Vocab size: {train_dataset.vocab_size}")
     
-    # Compute time statistics from training data
-    if rank == 0:  # Only compute on rank 0 to avoid duplicate computation
-        logger.info("Computing time statistics from training data...")
-        train_times = []
-        
-        # Collect all valid time values from training set
-        for i in tqdm(range(len(train_dataset)), desc="Collecting time values", disable=(rank != 0)):
-            sample = train_dataset[i]
-            con_time = sample['con_time']  # (max_events, 1) or (max_events,)
-            mask = sample['mask']  # (max_events,)
-            
-            # Convert to numpy if tensor
-            if isinstance(con_time, torch.Tensor):
-                con_time = con_time.numpy()
-            if isinstance(mask, torch.Tensor):
-                mask = mask.numpy()
-            
-            # Flatten and filter valid times (non-padding)
-            if con_time.ndim == 2:
-                con_time = con_time.flatten()
-            
-            # Use mask to filter valid events, then filter non-zero times
-            valid_mask = (mask > 0) if mask is not None else np.ones(len(con_time), dtype=bool)
-            valid_times = con_time[valid_mask]
-            
-            # Filter out padding values (0 or negative)
-            valid_times = valid_times[valid_times > 0]
-            
-            if len(valid_times) > 0:
-                train_times.extend(valid_times.tolist())
-        
-        if len(train_times) == 0:
-            logger.warning("No valid time values found! Using default statistics.")
-            mean_log_time = 0.0
-            std_log_time = 1.0
-            num_samples = 0
-        else:
-            train_times = np.array(train_times)
-            mean_log_time = float(np.mean(train_times))
-            std_log_time = float(np.std(train_times))
-            num_samples = len(train_times)
-            
-            logger.info(f"Time statistics computed: mean={mean_log_time:.6f}, std={std_log_time:.6f}")
-            logger.info(f"  Number of valid time values: {num_samples}")
-            logger.info(f"  Time range: [{np.min(train_times):.4f}, {np.max(train_times):.4f}]")
-        
-        # Save time statistics to checkpoint directory
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
-        time_stats = {
-            'mean_log_time': mean_log_time,
-            'std_log_time': std_log_time,
-            'num_samples': num_samples
-        }
-        time_stats_path = os.path.join(args.checkpoint_dir, 'time_stats.json')
-        with open(time_stats_path, 'w') as f:
-            json.dump(time_stats, f, indent=2)
-        
-        logger.info(f"Saved time statistics to {time_stats_path}")
-    else:
-        # For non-rank-0 processes, set default values (will be loaded from file if needed)
-        mean_log_time = 0.0
-        std_log_time = 1.0
-        time_stats = {'mean_log_time': mean_log_time, 'std_log_time': std_log_time}
+    # Get vocab sizes
+    vocab_sizes = train_dataset.get_vocab_sizes()
     
     # Create model
     logger.info("Creating model...")
     model = EHRDiffusionModel(
-        vocab_size=train_dataset.vocab_size,
+        vocab_size=vocab_sizes['token'],
+        type_vocab_size=vocab_sizes['type'],
+        dpe_vocab_size=vocab_sizes['dpe'],
         event_dim=args.event_dim,
         time_dim=args.time_dim,
+        pattern_dim=args.pattern_dim,
+        num_prompts=args.num_prompts,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         dropout=args.dropout,
-        use_prompts=args.use_prompts
+        use_prompts=True  # Always use prompts in this architecture
     )
     
     model = model.to(device)
@@ -352,12 +291,12 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {total_params:,}")
     logger.info(f"Trainable parameters: {trainable_params:,}")
-
-    if args.use_prompts:
-        prompt_params = model.prompt_generator.get_num_parameters()
-        logger.info(f"Prompt generator parameters: {prompt_params:,}")
-        logger.info(f"Number of prompts per patient: {model.prompt_generator.get_num_prompts()}")
-
+    
+    # Pattern prompts info
+    prompt_params = sum(p.numel() for p in model.pattern_prompts.parameters())
+    logger.info(f"Pattern prompts parameters: {prompt_params:,}")
+    logger.info(f"Number of learnable prompts: {args.num_prompts}")
+    
     # Wrap with DDP
     if args.distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -390,20 +329,23 @@ def main():
         'val_interval': args.val_interval,
         'save_interval': args.save_interval,
         'checkpoint_dir': args.checkpoint_dir,
+        'boundary_weight': args.boundary_weight,
         'recon_weight': args.recon_weight,
         'project_name': args.project_name,
         'run_name': args.run_name,
         'obs_window': args.obs_window,
-        'vocab_size': train_dataset.vocab_size,
+        'vocab_size': vocab_sizes['token'],
         'event_dim': args.event_dim,
         'time_dim': args.time_dim,
+        'pattern_dim': args.pattern_dim,
+        'num_prompts': args.num_prompts,
         'hidden_dim': args.hidden_dim,
         'num_layers': args.num_layers,
         'num_heads': args.num_heads,
         'timesteps': args.timesteps,
         'beta_schedule': args.beta_schedule,
-        'mean_log_time': mean_log_time,
-        'use_prompts': args.use_prompts
+        'beta_start': args.beta_start,
+        'beta_end': args.beta_end
     }
     
     # Create trainer

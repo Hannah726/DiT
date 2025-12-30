@@ -1,6 +1,6 @@
 """
 Time Decoder: Time Embedding -> Continuous Time
-Decodes time embeddings back to continuous time intervals
+Decodes time embeddings back to log1p(cumulative_minutes)
 """
 
 import torch
@@ -10,16 +10,15 @@ import torch.nn.functional as F
 
 class TimeDecoder(nn.Module):
     """
-    Decodes time embedding vectors back to continuous time intervals
+    Decodes time embeddings back to continuous time
     
-    Architecture:
-        MLP that reverses the TimeEncoder transformation
-        Outputs continuous time values (log-normalized)
+    Output: log1p(cumulative_minutes), same format as input
+    Note: No denormalization here - that's done at evaluation time
     
     Args:
-        time_dim: Input time embedding dimension
+        time_dim: Time embedding dimension (from HybridTimeEncoder)
         hidden_dim: Hidden layer dimension
-        output_dim: Output dimension (usually 1 for Delta-t)
+        output_dim: Output dimension (default: 1 for scalar time)
         dropout: Dropout rate
     """
     
@@ -45,7 +44,6 @@ class TimeDecoder(nn.Module):
             nn.Linear(hidden_dim, output_dim)
         )
         
-        # Initialize weights
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
@@ -60,39 +58,29 @@ class TimeDecoder(nn.Module):
             time_emb: (B, N, time_dim) - time embeddings
             
         Returns:
-            (B, N, output_dim) - continuous time intervals (log-normalized)
+            (B, N, 1) - log1p(cumulative_minutes)
         """
-        con_time = self.mlp(time_emb)
-        return con_time
+        return self.mlp(time_emb)
     
     def compute_reconstruction_loss(self, time_emb, target_time, mask=None):
         """
-        Compute MSE loss for time reconstruction
+        MSE loss for time reconstruction
         
         Args:
-            time_emb: (B, N, time_dim) - time embeddings
-            target_time: (B, N, 1) - ground truth continuous time
+            time_emb: (B, N, time_dim)
+            target_time: (B, N, 1) - log1p(cumulative_minutes)
             mask: (B, N) - valid event mask
-            
-        Returns:
-            loss: Scalar reconstruction loss
-            loss_dict: Dictionary of loss components
         """
-        predicted_time = self.forward(time_emb)  # (B, N, 1)
+        predicted_time = self.forward(time_emb)
         
         if mask is not None:
-            mask_expanded = mask.unsqueeze(-1)  # (B, N, 1)
+            mask_expanded = mask.unsqueeze(-1)
             loss = F.mse_loss(
                 predicted_time * mask_expanded,
                 target_time * mask_expanded,
                 reduction='sum'
-            ) / mask.sum()
+            ) / (mask.sum() + 1e-8)
         else:
             loss = F.mse_loss(predicted_time, target_time)
         
-        loss_dict = {
-            'time_recon': loss.item()
-        }
-        
-        return loss, loss_dict
-
+        return loss, {'time_recon': loss.item()}

@@ -1,6 +1,6 @@
 """
-Training loop for EHR Diffusion Model
-Supports distributed training, mixed precision, and WandB logging
+Training loop for EHR Diffusion Model with Pattern Discovery
+Supports boundary prediction, distributed training, mixed precision, and WandB logging
 """
 
 import os
@@ -22,9 +22,12 @@ import time
 
 class EHRDiffusionTrainer:
     """
-    Trainer for EHR Joint Event-Time Diffusion Model
+    Trainer for EHR Joint Event-Time Diffusion Model with Pattern Discovery
     
-    Features:
+    NEW Features:
+        - Pattern discovery prompts training
+        - Boundary distribution prediction
+        - Event-time joint modeling
         - DDPM training with MSE loss
         - Optional reconstruction loss
         - Distributed training support
@@ -33,7 +36,7 @@ class EHRDiffusionTrainer:
         - Checkpoint management
     
     Args:
-        model: Complete diffusion model (encoder + diffusion + decoder)
+        model: Complete diffusion model with pattern discovery
         diffusion: GaussianDiffusion instance
         optimizer: PyTorch optimizer
         train_loader: Training data loader
@@ -43,6 +46,7 @@ class EHRDiffusionTrainer:
         use_wandb: Whether to use WandB logging
         rank: Process rank for distributed training
         world_size: Total number of processes
+        scheduler: Learning rate scheduler
     """
     
     def __init__(
@@ -83,7 +87,8 @@ class EHRDiffusionTrainer:
         self.save_interval = config.get('save_interval', 5)
         self.checkpoint_dir = config.get('checkpoint_dir', 'outputs/checkpoints')
         
-        # Reconstruction loss weight
+        # Loss weights
+        self.boundary_weight = config.get('boundary_weight', 0.5)
         self.recon_weight = config.get('recon_weight', 0.0)
         
         # Mixed precision
@@ -101,15 +106,13 @@ class EHRDiffusionTrainer:
         # Initialize WandB
         if self.use_wandb:
             wandb.init(
-                project=config.get('project_name', 'ehr-diffusion'),
+                project=config.get('project_name', 'ehr-diffusion-patterns'),
                 config=config,
                 name=config.get('run_name', None)
             )
     
     def train_epoch(self):
-        """
-        Train for one epoch
-        """
+        """Train for one epoch"""
         self.model.train()
         
         epoch_loss = 0.0
@@ -132,6 +135,7 @@ class EHRDiffusionTrainer:
             if self.rank == 0:
                 pbar.set_postfix({
                     'loss': f"{loss:.4f}",
+                    'boundary': f"{metrics.get('boundary_loss', 0):.4f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
                 })
             
@@ -156,7 +160,7 @@ class EHRDiffusionTrainer:
     
     def train_step(self, batch):
         """
-        Single training step
+        Single training step with pattern discovery and boundary prediction
         
         Args:
             batch: Dictionary from dataloader
@@ -175,68 +179,89 @@ class EHRDiffusionTrainer:
         
         B, N, L = input_ids.shape
         
-        # Create token-level mask: valid tokens are those > 0
-        # This is critical for encoder to properly handle padding tokens
-        token_mask = (input_ids > 0).float()  # (B, N, L) - 1 for valid tokens, 0 for padding
+        # Create token-level mask
+        token_mask = (input_ids > 0).float()  # (B, N, L)
         
         with autocast(enabled=self.use_amp):
-            # Encode events and time
             model = self._get_model()
-            # Pass token_mask to encoder so it can properly mask padding tokens during attention pooling
-            event_latents = model.encoder(
-                input_ids, type_ids, dpe_ids, 
-                event_mask=token_mask  # (B, N, L) - mask for valid tokens
-            )  # (B, N, event_dim)
-            time_emb = model.time_encoder(con_time)  # (B, N, time_dim)
-            # Joint latent
-            joint_latent = torch.cat([event_latents, time_emb], dim=-1)  # (B, N, latent_dim)
-
-            # Generate prompts if using prompts
-            prompts = None
-            if hasattr(model, 'use_prompts') and model.use_prompts:
-                prompts = model.prompt_generator(demographics)
+            
+            # ========== NEW: Encode with Pattern Discovery ==========
+            # This replaces the old separate encoding
+            joint_latent, event_refined, time_refined, prompt_weights, true_length = model.encode(
+                input_ids, type_ids, dpe_ids, con_time,
+                event_mask=token_mask
+            )
+            # joint_latent: (B, N, 208) = [event_refined(96), time_refined(96), boundary_emb(16)]
+            # event_refined: (B, N, 96) - events enriched by time patterns
+            # time_refined: (B, N, 96) - times enriched by event patterns
+            # prompt_weights: (B, N, K) - which patterns are activated
+            # true_length: (B, N) - ground truth sequence lengths
             
             # Sample timesteps
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
             
-            # Diffusion loss
+            # ========== Diffusion Loss ==========
             noise = torch.randn_like(joint_latent)
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
             
-            # Predict noise - DiT handles demographics encoding internally via condition_embedder
+            # Generate prompts for DiT conditioning
+            # Need to pass prompts in DiT's expected format (B, P, 96)
+            # prompt_weights already computed above, but we need the actual prompt vectors
+            prompts_for_dit = model.pattern_prompts.prompts.unsqueeze(0).expand(B, -1, -1)  # (B, K, 96)
+            
+            # Predict noise with prompt conditioning
             predicted_noise = model.dit(
-                noisy_latent, t, 
-                prompts=prompts,
-                condition=demographics, mask=mask)
+                noisy_latent, t,
+                condition=demographics,
+                prompts=prompts_for_dit,
+                mask=mask
+            )
             
             # Compute diffusion loss
             if mask is not None:
-                mask_expanded = mask.unsqueeze(-1)
+                mask_expanded = mask.unsqueeze(-1)  # (B, N, 1)
                 diff_loss = F.mse_loss(
                     predicted_noise * mask_expanded,
                     noise * mask_expanded,
                     reduction='sum'
-                ) / mask.sum()
+                ) / (mask.sum() + 1e-8)
             else:
                 diff_loss = F.mse_loss(predicted_noise, noise)
             
-            # Optional reconstruction loss
+            # ========== NEW: Boundary Prediction Loss ==========
+            length_logits, length_dist = model.predict_boundary(
+                event_refined, prompt_weights
+            )
+            boundary_loss = model.boundary_predictor.compute_loss(
+                length_logits, true_length, mask=mask
+            )
+            
+            # ========== Optional Reconstruction Loss ==========
             if self.recon_weight > 0:
-                # Use the same token_mask created earlier for consistency
-                # This is critical for learning to distinguish valid tokens from padding
-                model = self._get_model()
-                recon_loss, _ = model.decoder.compute_reconstruction_loss(
-                    event_latents,
+                # Event reconstruction
+                event_recon_loss, _ = model.event_decoder.compute_reconstruction_loss(
+                    event_refined,
                     input_ids,
                     type_ids,
                     dpe_ids,
-                    mask=token_mask  # Pass token-level mask directly (already created above)
+                    mask=token_mask
                 )
                 
-                total_loss = diff_loss + self.recon_weight * recon_loss
+                # Time reconstruction
+                time_recon_loss, _ = model.time_decoder.compute_reconstruction_loss(
+                    time_refined, con_time, mask=mask
+                )
+                
+                recon_loss = event_recon_loss + time_recon_loss
             else:
-                total_loss = diff_loss
-                recon_loss = torch.tensor(0.0)
+                recon_loss = torch.tensor(0.0, device=self.device)
+            
+            # ========== Total Loss ==========
+            total_loss = (
+                diff_loss + 
+                self.boundary_weight * boundary_loss + 
+                self.recon_weight * recon_loss
+            )
         
         # Backward pass
         self.optimizer.zero_grad()
@@ -252,44 +277,49 @@ class EHRDiffusionTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.optimizer.step()
         
-        # Update learning rate scheduler
+        # Update scheduler
         if self.scheduler is not None:
             self.scheduler.step()
         
-        # Metrics
-        current_lr = self.optimizer.param_groups[0]['lr']
+        # ========== Metrics ==========
         metrics = {
             'diffusion_loss': diff_loss.item(),
+            'boundary_loss': boundary_loss.item(),
             'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else 0.0,
-            'lr': current_lr,
+            'lr': self.optimizer.param_groups[0]['lr']
         }
         
-        # Decode for monitoring (optional, only for logging)
-        # Note: This is for visualization/monitoring, not used in loss
-        if self.global_step % (self.log_interval * 10) == 0:  # Less frequent to save compute
+        # ========== Optional Monitoring (every 10 log intervals) ==========
+        if self.global_step % (self.log_interval * 10) == 0:
             with torch.no_grad():
-                # Decode joint latent to get events and time
-                model = self._get_model()
-                decoded_events, decoded_time = model.decode_joint_latent(
+                # Decode for monitoring
+                decoded_events, decoded_time, predicted_length, boundary_mask = model.decode_joint_latent(
                     joint_latent,
                     return_logits=False,
-                    denormalize_time=False  # Keep log-normalized for consistency
+                    deterministic_boundary=True
                 )
-                # decoded_events: dict with 'token' (B, N, L), 'type' (B, N, L), 'dpe' (B, N, L)
-                # decoded_time: (B, N, 1) - log-normalized
                 
-                # Optional: Compute time reconstruction error for monitoring
+                # Compute accuracy metrics
                 time_recon_error = F.mse_loss(decoded_time, con_time, reduction='mean')
+                
+                # Boundary accuracy: exact match
+                boundary_accuracy = (predicted_length == true_length).float().mean()
+                
+                # Boundary MAE
+                boundary_mae = (predicted_length - true_length).abs().float().mean()
+                
                 metrics['time_recon_error'] = time_recon_error.item()
-        else:
-            metrics['time_recon_error'] = 0.0
+                metrics['boundary_accuracy'] = boundary_accuracy.item()
+                metrics['boundary_mae'] = boundary_mae.item()
+                metrics['avg_predicted_length'] = predicted_length.float().mean().item()
+                metrics['avg_true_length'] = true_length.float().mean().item()
         
         return total_loss.item(), metrics
     
     @torch.no_grad()
     def validate(self):
         """
-        Validation loop
+        Validation loop with pattern discovery
         """
         if self.val_loader is None:
             return None
@@ -297,7 +327,9 @@ class EHRDiffusionTrainer:
         self.model.eval()
         
         val_loss = 0.0
-        val_metrics = {}
+        val_diff_loss = 0.0
+        val_boundary_loss = 0.0
+        val_recon_loss = 0.0
         
         pbar = tqdm(
             self.val_loader,
@@ -315,19 +347,15 @@ class EHRDiffusionTrainer:
             mask = batch['mask'].to(self.device)
             
             B, N, L = input_ids.shape
-
             token_mask = (input_ids > 0).float()
             
-            # Encode
             model = self._get_model()
-            event_latents = model.encoder(input_ids, type_ids, dpe_ids, event_mask=token_mask )
-            time_emb = model.time_encoder(con_time)
-            joint_latent = torch.cat([event_latents, time_emb], dim=-1)
             
-            # Generate prompts if using prompts
-            prompts = None
-            if hasattr(model, 'use_prompts') and model.use_prompts:
-                prompts = model.prompt_generator(demographics)
+            # Encode with pattern discovery
+            joint_latent, event_refined, time_refined, prompt_weights, true_length = model.encode(
+                input_ids, type_ids, dpe_ids, con_time,
+                event_mask=token_mask
+            )
             
             # Sample timesteps
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
@@ -336,25 +364,74 @@ class EHRDiffusionTrainer:
             noise = torch.randn_like(joint_latent)
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
             
-            # Predict noise - DiT will handle demographics encoding internally
-            predicted_noise = model.dit(
-                noisy_latent, t, 
-                prompts=prompts,
-                condition=demographics, mask=mask)
+            # Generate prompts
+            prompts_for_dit = model.pattern_prompts.prompts.unsqueeze(0).expand(B, -1, -1)
             
+            # Predict noise
+            predicted_noise = model.dit(
+                noisy_latent, t,
+                condition=demographics,
+                prompts=prompts_for_dit,
+                mask=mask
+            )
+            
+            # Compute diffusion loss
             if mask is not None:
                 mask_expanded = mask.unsqueeze(-1)
-                loss = F.mse_loss(
+                diff_loss = F.mse_loss(
                     predicted_noise * mask_expanded,
                     noise * mask_expanded,
                     reduction='sum'
-                ) / mask.sum()
+                ) / (mask.sum() + 1e-8)
             else:
-                loss = F.mse_loss(predicted_noise, noise)
+                diff_loss = F.mse_loss(predicted_noise, noise)
+            
+            # Boundary loss
+            length_logits, _ = model.predict_boundary(event_refined, prompt_weights)
+            boundary_loss = model.boundary_predictor.compute_loss(
+                length_logits, true_length, mask=mask
+            )
+            
+            # Optional reconstruction loss
+            if self.recon_weight > 0:
+                event_recon_loss, _ = model.event_decoder.compute_reconstruction_loss(
+                    event_refined, input_ids, type_ids, dpe_ids, mask=token_mask
+                )
+                time_recon_loss, _ = model.time_decoder.compute_reconstruction_loss(
+                    time_refined, con_time, mask=mask
+                )
+                recon_loss = event_recon_loss + time_recon_loss
+            else:
+                recon_loss = torch.tensor(0.0, device=self.device)
+            
+            # Total loss
+            loss = (
+                diff_loss + 
+                self.boundary_weight * boundary_loss + 
+                self.recon_weight * recon_loss
+            )
             
             val_loss += loss.item()
+            val_diff_loss += diff_loss.item()
+            val_boundary_loss += boundary_loss.item()
+            val_recon_loss += recon_loss.item() if isinstance(recon_loss, torch.Tensor) else 0.0
         
-        val_loss /= len(self.val_loader)
+        # Average
+        num_batches = len(self.val_loader)
+        val_loss /= num_batches
+        val_diff_loss /= num_batches
+        val_boundary_loss /= num_batches
+        val_recon_loss /= num_batches
+        
+        # Log detailed validation metrics
+        if self.use_wandb:
+            wandb.log({
+                'val/total_loss': val_loss,
+                'val/diffusion_loss': val_diff_loss,
+                'val/boundary_loss': val_boundary_loss,
+                'val/recon_loss': val_recon_loss,
+                'epoch': self.epoch
+            })
         
         return val_loss
     
@@ -369,7 +446,6 @@ class EHRDiffusionTrainer:
         if self.rank != 0:
             return
         
-        # Get actual model (unwrap DDP if needed) for saving
         model_to_save = self._get_model()
         
         checkpoint = {
@@ -387,7 +463,7 @@ class EHRDiffusionTrainer:
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
-        # Save regular checkpoint (only if save_epoch_file is True)
+        # Save regular checkpoint
         if save_epoch_file:
             checkpoint_path = os.path.join(
                 self.checkpoint_dir,
@@ -403,15 +479,12 @@ class EHRDiffusionTrainer:
             print(f"Saved best checkpoint to {best_path}")
     
     def load_checkpoint(self, checkpoint_path):
-        """
-        Load model checkpoint
-        """
+        """Load model checkpoint"""
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
         
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # Get actual model (unwrap DDP if needed) for loading
         model_to_load = self._get_model()
         model_to_load.load_state_dict(checkpoint['model_state_dict'])
         
@@ -429,12 +502,12 @@ class EHRDiffusionTrainer:
         print(f"Loaded checkpoint from epoch {self.epoch}, step {self.global_step}")
     
     def train(self):
-        """
-        Full training loop
-        """
+        """Full training loop"""
         print(f"Starting training for {self.epochs} epochs")
         print(f"Device: {self.device}")
         print(f"Rank: {self.rank}/{self.world_size}")
+        print(f"Boundary weight: {self.boundary_weight}")
+        print(f"Reconstruction weight: {self.recon_weight}")
         
         start_epoch = self.epoch + 1 if self.global_step > 0 else self.epoch
         for epoch in range(start_epoch, self.epochs):
@@ -444,38 +517,32 @@ class EHRDiffusionTrainer:
             train_loss, train_metrics = self.train_epoch()
             
             print(f"\nEpoch {epoch}: Train Loss = {train_loss:.4f}")
+            print(f"  Diffusion: {train_metrics.get('diffusion_loss', 0):.4f}")
+            print(f"  Boundary: {train_metrics.get('boundary_loss', 0):.4f}")
+            if self.recon_weight > 0:
+                print(f"  Reconstruction: {train_metrics.get('recon_loss', 0):.4f}")
             
             # Validation
             if self.val_loader is not None and (epoch % self.val_interval == 0):
                 val_loss = self.validate()
                 print(f"Epoch {epoch}: Val Loss = {val_loss:.4f}")
                 
-                # Log to WandB
-                if self.use_wandb:
-                    wandb.log({
-                        'val/loss': val_loss,
-                        'epoch': epoch
-                    })
-                
                 # Save best checkpoint
                 is_best = val_loss < self.best_val_loss
                 if is_best:
                     self.best_val_loss = val_loss
+                    print(f"  New best validation loss!")
                 
-                # Save checkpoint: only save epoch file at save_interval, but always update best if improved
-                # Note: epoch is 0-indexed, so (epoch + 1) % save_interval == 0 means save at the 10th, 20th, etc. epoch
-                # Also save at epoch 0 (the first epoch)
+                # Save checkpoint
                 save_epoch_file = (epoch == 0 or (epoch + 1) % self.save_interval == 0)
                 if save_epoch_file or is_best:
                     self.save_checkpoint(is_best=is_best, save_epoch_file=save_epoch_file)
             else:
                 # Save without validation
-                # Note: epoch is 0-indexed, so (epoch + 1) % save_interval == 0 means save at the 10th, 20th, etc. epoch
-                # Also save at epoch 0 (the first epoch)
                 if epoch == 0 or (epoch + 1) % self.save_interval == 0:
                     self.save_checkpoint()
         
-        print("Training completed!")
+        print("\nTraining completed!")
         
         if self.use_wandb:
             wandb.finish()
