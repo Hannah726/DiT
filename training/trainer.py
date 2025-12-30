@@ -58,6 +58,13 @@ class EHRDiffusionTrainer:
         self.boundary_weight = config.get('boundary_weight', 0.5)
         self.recon_weight = config.get('recon_weight', 0.1)
         
+        # Scheduled sampling for boundary prediction
+        # Gradually transition from true_length to predicted_length during training
+        self.scheduled_sampling = config.get('scheduled_sampling', True)
+        self.scheduled_sampling_start = config.get('scheduled_sampling_start', 0.0)  # Start epoch
+        self.scheduled_sampling_end = config.get('scheduled_sampling_end', 0.5)  # End epoch (as fraction of total epochs)
+        self.scheduled_sampling_prob = 1.0  # Will be updated during training
+        
         self.use_amp = config.get('use_amp', False)
         if self.use_amp:
             self.scaler = torch.cuda.amp.GradScaler()
@@ -143,7 +150,7 @@ class EHRDiffusionTrainer:
             # Extract event_latent from predicted_x0 (first pattern_dim dimensions)
             predicted_event_latent = predicted_x0[..., :model.pattern_dim]
             # Predict boundary from denoised event latent
-            length_logits, _ = model.predict_boundary(predicted_event_latent)
+            length_logits, length_dist = model.predict_boundary(predicted_event_latent)
             
             boundary_loss = model.boundary_predictor.compute_loss(
                 length_logits,
@@ -151,13 +158,33 @@ class EHRDiffusionTrainer:
                 mask=event_level_mask
             )
             
+            # Scheduled sampling: gradually transition from true_length to predicted_length
+            if self.scheduled_sampling and self.training:
+                # Sample predicted length
+                predicted_length = model.boundary_predictor.sample_length(
+                    length_dist,
+                    deterministic=False,  # Use sampling during training
+                    temperature=1.0
+                )
+                # Decide whether to use true_length or predicted_length
+                use_predicted = torch.rand(B, device=self.device) < self.scheduled_sampling_prob
+                # Use predicted_length where scheduled, true_length otherwise
+                boundary_length_for_mask = torch.where(
+                    use_predicted.unsqueeze(-1),
+                    predicted_length,
+                    true_length
+                )
+            else:
+                # Always use true_length (no scheduled sampling)
+                boundary_length_for_mask = true_length
+            
             recon_loss = 0.0
             if self.recon_weight > 0:
-                # Apply BAD constraint during training: create boundary_mask from true_length
-                B, N = true_length.shape
+                # Apply BAD constraint during training: use scheduled sampling for boundary_mask
+                B, N = boundary_length_for_mask.shape
                 L = model.event_decoder.max_token_len
                 positions = torch.arange(L, device=self.device).unsqueeze(0).unsqueeze(0)
-                boundary_mask_train = (positions < true_length.unsqueeze(-1)).float()
+                boundary_mask_train = (positions < boundary_length_for_mask.unsqueeze(-1)).float()
                 
                 # Combine event_mask and boundary_mask for reconstruction loss
                 combined_mask = event_mask * boundary_mask_train
@@ -167,7 +194,8 @@ class EHRDiffusionTrainer:
                     input_ids,
                     type_ids,
                     dpe_ids,
-                    mask=combined_mask  # Use combined mask with BAD constraint
+                    mask=combined_mask,  # Use combined mask with BAD constraint
+                    target_length=boundary_length_for_mask  # Length-aware decoding with scheduled sampling
                 )
                 
                 time_recon_loss, _ = model.time_decoder.compute_reconstruction_loss(
@@ -311,6 +339,21 @@ class EHRDiffusionTrainer:
     def train_epoch(self):
         """Train for one epoch"""
         metric_logger = MetricLogger(delimiter="  ")
+        
+        # Update scheduled sampling probability
+        if self.scheduled_sampling:
+            total_epochs = self.config.get('epochs', 100)
+            start_epoch = int(self.scheduled_sampling_start * total_epochs)
+            end_epoch = int(self.scheduled_sampling_end * total_epochs)
+            
+            if self.current_epoch < start_epoch:
+                self.scheduled_sampling_prob = 0.0  # Always use true_length
+            elif self.current_epoch >= end_epoch:
+                self.scheduled_sampling_prob = 1.0  # Always use predicted_length
+            else:
+                # Linear interpolation between start and end
+                progress = (self.current_epoch - start_epoch) / (end_epoch - start_epoch)
+                self.scheduled_sampling_prob = progress
         
         for batch in tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}", disable=self.rank != 0):
             loss_dict = self.train_step(batch)

@@ -196,13 +196,14 @@ class EHRDiffusionModel(nn.Module):
         
         return joint_latent, event_refined, time_refined, prompt_weights, true_length
     
-    def decode(self, event_latent, boundary_mask=None, return_logits=False):
+    def decode(self, event_latent, boundary_mask=None, target_length=None, return_logits=False):
         """
         Decode event latent back to tokens
         
         Args:
             event_latent: (B, N, 96) - refined event latents
             boundary_mask: (B, N, L) - boundary constraint mask (optional)
+            target_length: (B, N) - target length for length-aware decoding (optional)
             return_logits: Whether to return logits
         
         Returns:
@@ -211,6 +212,7 @@ class EHRDiffusionModel(nn.Module):
         return self.event_decoder(
             event_latent,
             boundary_mask=boundary_mask,
+            target_length=target_length,
             return_logits=return_logits
         )
     
@@ -272,9 +274,11 @@ class EHRDiffusionModel(nn.Module):
         positions = torch.arange(L, device=predicted_length.device).unsqueeze(0).unsqueeze(0)
         boundary_mask = (positions < predicted_length.unsqueeze(-1)).float()
         
+        # Use length-aware decoding with predicted_length
         decoded_events = self.event_decoder(
             event_latent,
             boundary_mask=boundary_mask,
+            target_length=predicted_length,  # Length-aware decoding
             return_logits=return_logits
         )
         

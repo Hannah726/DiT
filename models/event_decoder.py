@@ -49,9 +49,20 @@ class EventDecoder(nn.Module):
         self.vocab_sizes = vocab_sizes
         self.max_token_len = max_token_len
         
-        # Expand event latent
+        # Length embedding for length-aware decoding
+        self.length_embedding = nn.Embedding(max_token_len + 1, hidden_dim)
+        
+        # Expand event latent (now with length information)
         self.latent_proj = nn.Sequential(
             nn.Linear(event_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Length-aware projection: combine event latent with length embedding
+        self.length_aware_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # event + length
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
@@ -94,12 +105,14 @@ class EventDecoder(nn.Module):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, event_latents, boundary_mask=None, return_logits=False):
+    def forward(self, event_latents, boundary_mask=None, target_length=None, return_logits=False):
         """
         Args:
             event_latents: (B, N, event_dim) - event latent vectors
             boundary_mask: (B, N, L) - optional boundary constraint mask
                           1 for valid positions, 0 for padding
+            target_length: (B, N) - optional target length for length-aware decoding
+                          If None, will be inferred from boundary_mask
             return_logits: Whether to return raw logits or sampled IDs
         
         Returns:
@@ -114,7 +127,23 @@ class EventDecoder(nn.Module):
         L = self.max_token_len
         
         # Project event latents
-        x = self.latent_proj(event_latents)  # (B, N, hidden_dim)
+        event_h = self.latent_proj(event_latents)  # (B, N, hidden_dim)
+        
+        # Length-aware decoding: incorporate target length information
+        if target_length is not None:
+            # Embed target length
+            length_emb = self.length_embedding(target_length)  # (B, N, hidden_dim)
+            # Combine event and length information
+            x = self.length_aware_proj(torch.cat([event_h, length_emb], dim=-1))  # (B, N, hidden_dim)
+        elif boundary_mask is not None:
+            # Infer length from boundary_mask
+            inferred_length = boundary_mask.sum(dim=-1).long()  # (B, N)
+            inferred_length = torch.clamp(inferred_length, 0, self.max_token_len)
+            length_emb = self.length_embedding(inferred_length)  # (B, N, hidden_dim)
+            x = self.length_aware_proj(torch.cat([event_h, length_emb], dim=-1))  # (B, N, hidden_dim)
+        else:
+            # No length information, use event latent only
+            x = event_h
         
         # Expand to token level
         x_expanded = self.token_expander(x)  # (B, N, hidden_dim * L)
@@ -160,7 +189,7 @@ class EventDecoder(nn.Module):
             }
     
     def compute_reconstruction_loss(self, event_latents, target_tokens, 
-                                   target_types, target_dpes, mask=None):
+                                   target_types, target_dpes, mask=None, target_length=None):
         """
         Compute cross-entropy loss for reconstruction
         
@@ -170,13 +199,14 @@ class EventDecoder(nn.Module):
             target_types: (B, N, L) - ground truth type IDs
             target_dpes: (B, N, L) - ground truth DPE IDs
             mask: (B, N, L) - valid token mask (1 for valid, 0 for padding)
+            target_length: (B, N) - target length for length-aware decoding (optional)
         
         Returns:
             loss: Scalar reconstruction loss
             loss_dict: Dictionary of loss components
         """
-        # Get logits
-        logits = self.forward(event_latents, return_logits=True)
+        # Get logits with length-aware decoding
+        logits = self.forward(event_latents, boundary_mask=mask, target_length=target_length, return_logits=True)
         
         B, N, L = target_tokens.shape
         
