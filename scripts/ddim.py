@@ -35,7 +35,10 @@ class DDIMSampler:
         demographics=None,
         batch_size=32,
         eta=0.0,
-        deterministic_boundary=True
+        deterministic_boundary=True,
+        soft_boundary=False,
+        boundary_temperature=1.0,
+        top_k=3
     ):
         """
         Generate synthetic EHR data
@@ -47,6 +50,9 @@ class DDIMSampler:
             batch_size: Batch size for generation
             eta: DDIM stochasticity (0=deterministic)
             deterministic_boundary: Use argmax for boundary prediction
+            soft_boundary: If True, use top-k sampling for robust boundary prediction
+            boundary_temperature: Temperature for boundary sampling (lower = more deterministic)
+            top_k: Number of top candidates in soft boundary mode
         
         Returns:
             dict with 'token', 'type', 'dpe', 'time', 'length'
@@ -75,7 +81,10 @@ class DDIMSampler:
                 num_events,
                 batch_demographics,
                 eta=eta,
-                deterministic_boundary=deterministic_boundary
+                deterministic_boundary=deterministic_boundary,
+                soft_boundary=soft_boundary,
+                boundary_temperature=boundary_temperature,
+                top_k=top_k
             )
             
             for key in all_outputs:
@@ -94,7 +103,10 @@ class DDIMSampler:
         num_events,
         demographics,
         eta=0.0,
-        deterministic_boundary=True
+        deterministic_boundary=True,
+        soft_boundary=False,
+        boundary_temperature=1.0,
+        top_k=3
     ):
         """Sample a single batch"""
         model = self.model.module if hasattr(self.model, 'module') else self.model
@@ -141,11 +153,14 @@ class DDIMSampler:
                 eta=eta
             )
         
-        # Decode final latent
+        # Decode final latent with soft boundary option
         decoded_events, decoded_time, predicted_length, boundary_mask = model.decode_joint_latent(
             x,
             return_logits=False,
-            deterministic_boundary=deterministic_boundary
+            deterministic_boundary=deterministic_boundary,
+            soft_boundary=soft_boundary,
+            boundary_temperature=boundary_temperature,
+            top_k=top_k
         )
         
         # Convert to numpy
@@ -180,6 +195,12 @@ def parse_args():
                        help='DDIM stochasticity parameter (0=deterministic, 1=DDPM)')
     parser.add_argument('--deterministic_boundary', action='store_true',
                        help='Use argmax for boundary (vs sampling)')
+    parser.add_argument('--soft_boundary', action='store_true',
+                       help='Use top-k sampling for robust boundary prediction')
+    parser.add_argument('--boundary_temperature', type=float, default=1.0,
+                       help='Temperature for boundary sampling (lower = more deterministic)')
+    parser.add_argument('--top_k', type=int, default=3,
+                       help='Number of top candidates in soft boundary mode')
     
     parser.add_argument('--convert_to_input', action='store_true',
                        help='Convert reduced vocab to original vocab')
@@ -258,6 +279,8 @@ def main():
     print(f"  DDIM steps: {args.ddim_steps}")
     print(f"  Eta: {args.eta}")
     print(f"  Deterministic boundary: {args.deterministic_boundary}")
+    if args.soft_boundary:
+        print(f"  Soft boundary: enabled (top_k={args.top_k}, temperature={args.boundary_temperature})")
     
     demographics = None  # No demographics for now
     all_outputs = sampler.sample(
@@ -266,7 +289,10 @@ def main():
         demographics=demographics,
         batch_size=args.batch_size,
         eta=args.eta,
-        deterministic_boundary=args.deterministic_boundary
+        deterministic_boundary=args.deterministic_boundary,
+        soft_boundary=args.soft_boundary,
+        boundary_temperature=args.boundary_temperature,
+        top_k=args.top_k
     )
     
     # Convert token IDs if requested

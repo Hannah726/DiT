@@ -161,10 +161,13 @@ class EHRDiffusionTrainer:
             # Scheduled sampling: gradually transition from true_length to predicted_length
             if self.scheduled_sampling and self.training:
                 # Sample predicted length
+                # Use soft boundary sampling during training for robustness
                 predicted_length = model.boundary_predictor.sample_length(
                     length_dist,
                     deterministic=False,  # Use sampling during training
-                    temperature=1.0
+                    temperature=1.0,
+                    soft_boundary=True,  # Use top-k sampling for robustness
+                    top_k=3  # Consider top-3 candidates
                 )
                 # Decide whether to use true_length or predicted_length
                 use_predicted = torch.rand(B, device=self.device) < self.scheduled_sampling_prob

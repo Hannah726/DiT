@@ -73,21 +73,54 @@ class SimpleBoundaryPredictor(nn.Module):
         
         return length_logits, length_dist
     
-    def sample_length(self, length_dist, temperature=1.0, deterministic=False):
+    def sample_length(self, length_dist, temperature=1.0, deterministic=False, 
+                     soft_boundary=False, top_k=3):
         """
-        Sample or select sequence length
+        Sample or select sequence length with optional soft boundary
         
         Args:
             length_dist: (B, N, max_len+1) - probability distribution
             temperature: Sampling temperature (lower = more deterministic)
             deterministic: If True, use argmax
+            soft_boundary: If True, use top-k sampling for robustness
+                          This provides uncertainty and avoids hard truncation
+            top_k: Number of top candidates to consider in soft boundary mode
         
         Returns:
             (B, N) - predicted lengths [0, max_len]
         """
         if deterministic:
             return torch.argmax(length_dist, dim=-1)
+        
+        if soft_boundary:
+            # Soft boundary: sample from top-k candidates
+            # This provides robustness against single-point failures
+            # and increases length uncertainty for better generalization
+            B, N, L = length_dist.shape
+            
+            # Get top-k candidates
+            topk_probs, topk_indices = torch.topk(length_dist, k=min(top_k, L), dim=-1)
+            # Renormalize top-k probabilities
+            topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-10)
+            
+            # Sample from top-k (with temperature)
+            logits = torch.log(topk_probs + 1e-10) / temperature
+            probs = F.softmax(logits, dim=-1)
+            
+            # Sample indices in top-k space
+            probs_flat = probs.view(B * N, -1)
+            sampled_topk_idx = torch.multinomial(
+                probs_flat, 
+                num_samples=1
+            ).squeeze(-1)  # (B*N,)
+            
+            # Map back to original length space
+            sampled_topk_idx = sampled_topk_idx.view(B, N, 1)
+            samples = torch.gather(topk_indices, -1, sampled_topk_idx).squeeze(-1)
+            
+            return samples
         else:
+            # Standard sampling from full distribution
             logits = torch.log(length_dist + 1e-10) / temperature
             B, N, L = logits.shape
             

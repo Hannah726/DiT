@@ -242,7 +242,8 @@ class EHRDiffusionModel(nn.Module):
         return self.boundary_predictor(event_refined)
     
     def decode_joint_latent(self, joint_latent, return_logits=False, 
-                           deterministic_boundary=True):
+                           deterministic_boundary=True, soft_boundary=False, 
+                           boundary_temperature=1.0, top_k=3):
         """
         Decode joint latent to events, time, and boundary
         
@@ -250,6 +251,9 @@ class EHRDiffusionModel(nn.Module):
             joint_latent: (B, N, 192) - denoised joint latent (event + time only)
             return_logits: Whether to return logits for events
             deterministic_boundary: Use argmax for boundary (vs sampling)
+            soft_boundary: If True, use top-k sampling for robust boundary prediction
+            boundary_temperature: Temperature for boundary sampling (lower = more deterministic)
+            top_k: Number of top candidates in soft boundary mode
         
         Returns:
             decoded_events: dict with 'token', 'type', 'dpe'
@@ -266,7 +270,10 @@ class EHRDiffusionModel(nn.Module):
         
         predicted_length = self.boundary_predictor.sample_length(
             length_dist,
-            deterministic=deterministic_boundary
+            temperature=boundary_temperature,
+            deterministic=deterministic_boundary,
+            soft_boundary=soft_boundary,
+            top_k=top_k
         )
         
         B, N = predicted_length.shape
@@ -300,7 +307,8 @@ class EHRDiffusionModel(nn.Module):
         decoded_events, decoded_time, predicted_length, boundary_mask = self.decode_joint_latent(
             joint_latent,
             return_logits=False,
-            deterministic_boundary=True
+            deterministic_boundary=True,
+            soft_boundary=False  # Use deterministic for forward pass
         )
         
         return {
