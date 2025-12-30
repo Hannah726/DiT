@@ -39,6 +39,10 @@ def parse_args():
                        help='Use reduced vocabulary')
     
     # Model arguments
+    parser.add_argument('--use_demographics', action='store_true', default=False,
+                       help='Use demographics as conditioning (default: False)')
+    parser.add_argument('--demographic_dim', type=int, default=2,
+                       help='Demographics dimension (age, sex, etc.)')
     parser.add_argument('--event_dim', type=int, default=64,
                        help='Event latent dimension (from StructuredEventEncoder)')
     parser.add_argument('--time_dim', type=int, default=32,
@@ -86,6 +90,18 @@ def parse_args():
                        help='Boundary prediction loss weight')
     parser.add_argument('--recon_weight', type=float, default=0.1,
                        help='Reconstruction loss weight (optional)')
+    
+    # Scheduled sampling arguments
+    parser.add_argument('--scheduled_sampling', action='store_true', default=False,
+                       help='Use scheduled sampling for boundary prediction (default: False)')
+    parser.add_argument('--scheduled_sampling_start', type=float, default=0.0,
+                       help='Start epoch for scheduled sampling (as fraction of total epochs)')
+    parser.add_argument('--scheduled_sampling_end', type=float, default=0.5,
+                       help='End epoch for scheduled sampling (as fraction of total epochs)')
+    
+    # Model architecture arguments
+    parser.add_argument('--max_token_len', type=int, default=128,
+                       help='Maximum token length per event')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=4,
@@ -263,6 +279,8 @@ def main():
     logger.info(f"Train dataset size: {len(train_dataset)}")
     logger.info(f"Val dataset size: {len(val_dataset)}")
     logger.info(f"Vocab size: {train_dataset.vocab_size}")
+    logger.info(f"Use demographics: {args.use_demographics}")
+    logger.info(f"Demographics dimension: {args.demographic_dim}")
     
     # Get vocab sizes
     vocab_sizes = train_dataset.get_vocab_sizes()
@@ -280,7 +298,9 @@ def main():
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
+        demographic_dim=args.demographic_dim,  # Pass demographics dimension
         dropout=args.dropout,
+        max_token_len=args.max_token_len,  # Pass max_token_len
         use_prompts=True  # Always use prompts in this architecture
     )
     
@@ -334,6 +354,11 @@ def main():
         'checkpoint_dir': args.checkpoint_dir,
         'boundary_weight': args.boundary_weight,
         'recon_weight': args.recon_weight,
+        'use_demographics': args.use_demographics,
+        'scheduled_sampling': args.scheduled_sampling,
+        'scheduled_sampling_start': args.scheduled_sampling_start,
+        'scheduled_sampling_end': args.scheduled_sampling_end,
+        'max_token_len': args.max_token_len,
         'project_name': args.project_name,
         'run_name': args.run_name,
         'obs_window': args.obs_window,
@@ -345,6 +370,7 @@ def main():
         'hidden_dim': args.hidden_dim,
         'num_layers': args.num_layers,
         'num_heads': args.num_heads,
+        'demographic_dim': args.demographic_dim,
         'timesteps': args.timesteps,
         'beta_schedule': args.beta_schedule,
         'beta_start': args.beta_start,

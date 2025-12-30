@@ -58,9 +58,12 @@ class EHRDiffusionTrainer:
         self.boundary_weight = config.get('boundary_weight', 0.5)
         self.recon_weight = config.get('recon_weight', 0.1)
         
+        # Demographics conditioning
+        self.use_demographics = config.get('use_demographics', False)
+        
         # Scheduled sampling for boundary prediction
         # Gradually transition from true_length to predicted_length during training
-        self.scheduled_sampling = config.get('scheduled_sampling', True)
+        self.scheduled_sampling = config.get('scheduled_sampling', False)
         self.scheduled_sampling_start = config.get('scheduled_sampling_start', 0.0)  # Start epoch
         self.scheduled_sampling_end = config.get('scheduled_sampling_end', 0.5)  # End epoch (as fraction of total epochs)
         self.scheduled_sampling_prob = 1.0  # Will be updated during training
@@ -128,9 +131,11 @@ class EHRDiffusionTrainer:
             else:
                 prompts_for_dit = None
             
+            # Use demographics conditionally based on config
+            condition = demographics if self.use_demographics else None
             predicted_noise = model.dit(
                 noisy_latent, t,
-                condition=demographics,
+                condition=condition,
                 prompts=prompts_for_dit,
                 mask=event_level_mask
             )
@@ -143,14 +148,20 @@ class EHRDiffusionTrainer:
             ) / event_level_mask.sum()
             
             # Boundary prediction from denoised latent (consistent with inference)
+            # During inference, boundary is predicted from fully denoised joint_latent (after complete DDIM sampling)
+            # During training, we should also predict boundary from denoised latent to maintain consistency
+            # However, we use predicted_x0 (single-step prediction) which is an approximation of fully denoised latent
             # Predict x_0 from noisy latent and predicted noise
             predicted_x0 = self.diffusion.predict_start_from_noise(
                 noisy_latent, t, predicted_noise
             )
             # Extract event_latent from predicted_x0 (first pattern_dim dimensions)
-            predicted_event_latent = predicted_x0[..., :model.pattern_dim]
-            # Predict boundary from denoised event latent
-            length_logits, length_dist = model.predict_boundary(predicted_event_latent)
+            # This is the denoised event latent from single-step prediction
+            # Note: This is consistent with inference where boundary is predicted from fully denoised joint_latent
+            # The predicted_x0 is an approximation that becomes more accurate as training progresses
+            denoised_event_latent = predicted_x0[..., :model.pattern_dim]
+            # Predict boundary from denoised event latent (same as inference)
+            length_logits, length_dist = model.predict_boundary(denoised_event_latent)
             
             boundary_loss = model.boundary_predictor.compute_loss(
                 length_logits,
@@ -159,7 +170,7 @@ class EHRDiffusionTrainer:
             )
             
             # Scheduled sampling: gradually transition from true_length to predicted_length
-            if self.scheduled_sampling and self.training:
+            if self.scheduled_sampling:
                 # Sample predicted length
                 # Use soft boundary sampling during training for robustness
                 predicted_length = model.boundary_predictor.sample_length(
@@ -192,8 +203,13 @@ class EHRDiffusionTrainer:
                 # Combine event_mask and boundary_mask for reconstruction loss
                 combined_mask = event_mask * boundary_mask_train
                 
+                # Use denoised latents from predicted_x0 for reconstruction loss (consistent with boundary prediction)
+                # Extract event and time latents from predicted_x0
+                denoised_event_latent_for_recon = predicted_x0[..., :model.pattern_dim]
+                denoised_time_latent_for_recon = predicted_x0[..., model.pattern_dim:2*model.pattern_dim]
+                
                 event_recon_loss, _ = model.event_decoder.compute_reconstruction_loss(
-                    event_refined,
+                    denoised_event_latent_for_recon,  # Use denoised event latent from predicted_x0
                     input_ids,
                     type_ids,
                     dpe_ids,
@@ -202,7 +218,7 @@ class EHRDiffusionTrainer:
                 )
                 
                 time_recon_loss, _ = model.time_decoder.compute_reconstruction_loss(
-                    time_refined,
+                    denoised_time_latent_for_recon,  # Use denoised time latent from predicted_x0
                     con_time,
                     mask=event_level_mask
                 )
@@ -293,9 +309,11 @@ class EHRDiffusionTrainer:
         else:
             prompts_for_dit = None
         
+        # Use demographics conditionally based on config
+        condition = demographics if self.use_demographics else None
         predicted_noise = model.dit(
             noisy_latent, t,
-            condition=demographics,
+            condition=condition,
             prompts=prompts_for_dit,
             mask=event_level_mask
         )

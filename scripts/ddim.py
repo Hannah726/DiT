@@ -14,7 +14,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from models.ehr_diffusion import EHRDiffusionModel
-from models.diffusion.scheduler import DDIMScheduler
+from models.scheduler import DDIMScheduler
 from utils.vocab_utils import load_id2word, convert_token_ids_to_input
 
 
@@ -248,7 +248,9 @@ def main():
         hidden_dim=config['hidden_dim'],
         num_layers=config['num_layers'],
         num_heads=config['num_heads'],
+        demographic_dim=config.get('demographic_dim', 2),  # Load from config
         dropout=0.0,
+        max_token_len=config.get('max_token_len', 128),  # Load from config
         use_prompts=True
     )
     

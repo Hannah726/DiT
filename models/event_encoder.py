@@ -111,7 +111,8 @@ class AttentionPooling(nn.Module):
         scores = torch.bmm(query, x.transpose(1, 2)) * self.scale  # (B, 1, L)
         
         if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(1) == 0, -1e9)
+            # Use -1e4 instead of -1e9 for AMP compatibility
+            scores = scores.masked_fill(mask.unsqueeze(1) == 0, -1e4)
         
         attn = F.softmax(scores, dim=-1)  # (B, 1, L)
         pooled = torch.bmm(attn, x).squeeze(1)  # (B, D)
