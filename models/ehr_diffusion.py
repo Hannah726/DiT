@@ -284,13 +284,13 @@ class EHRDiffusionModel(nn.Module):
             reconstructed: dict with keys 'token', 'type', 'dpe', 'time'
             (optional) latents: dict with latent representations
         """
-        # Create token-level mask
-        token_mask = (input_ids.sum(dim=-1) > 0).float()  # (B, N)
-        token_mask_expanded = token_mask.unsqueeze(-1).expand_as(input_ids)  # (B, N, L)
+        # Create token-level mask: valid tokens are those > 0
+        # This is critical for encoder to properly handle padding tokens
+        token_mask = (input_ids > 0).float()  # (B, N, L) - 1 for valid tokens, 0 for padding
         
         # Encode
         joint_latent, event_latent, time_emb = self.encode(
-            input_ids, type_ids, dpe_ids, con_time, event_mask=token_mask_expanded
+            input_ids, type_ids, dpe_ids, con_time, event_mask=token_mask
         )
         
         # Decode
@@ -324,14 +324,20 @@ class EHRDiffusionModel(nn.Module):
             type_ids: (B, N, L) - type IDs
             dpe_ids: (B, N, L) - DPE IDs
             con_time: (B, N, 1) - continuous time intervals
-            mask: (B, N, L) - valid token mask
+            mask: (B, N, L) - valid token mask (if None, will be created from input_ids)
         
         Returns:
             loss: Scalar reconstruction loss
             loss_dict: Dictionary of loss components
         """
-        # Encode
-        _, event_latent, _ = self.encode(input_ids, type_ids, dpe_ids, con_time)
+        # Create token-level mask if not provided
+        if mask is None:
+            mask = (input_ids > 0).float()  # (B, N, L) - 1 for valid tokens, 0 for padding
+        
+        # Encode with mask
+        _, event_latent, _ = self.encode(
+            input_ids, type_ids, dpe_ids, con_time, event_mask=mask
+        )
         
         # Compute reconstruction loss
         loss, loss_dict = self.decoder.compute_reconstruction_loss(

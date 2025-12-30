@@ -175,10 +175,18 @@ class EHRDiffusionTrainer:
         
         B, N, L = input_ids.shape
         
+        # Create token-level mask: valid tokens are those > 0
+        # This is critical for encoder to properly handle padding tokens
+        token_mask = (input_ids > 0).float()  # (B, N, L) - 1 for valid tokens, 0 for padding
+        
         with autocast(enabled=self.use_amp):
             # Encode events and time
             model = self._get_model()
-            event_latents = model.encoder(input_ids, type_ids, dpe_ids)  # (B, N, event_dim)
+            # Pass token_mask to encoder so it can properly mask padding tokens during attention pooling
+            event_latents = model.encoder(
+                input_ids, type_ids, dpe_ids, 
+                event_mask=token_mask  # (B, N, L) - mask for valid tokens
+            )  # (B, N, event_dim)
             time_emb = model.time_encoder(con_time)  # (B, N, time_dim)
             # Joint latent
             joint_latent = torch.cat([event_latents, time_emb], dim=-1)  # (B, N, latent_dim)
@@ -214,17 +222,15 @@ class EHRDiffusionTrainer:
             
             # Optional reconstruction loss
             if self.recon_weight > 0:
-                # Create token-level mask: valid tokens are those > 0
+                # Use the same token_mask created earlier for consistency
                 # This is critical for learning to distinguish valid tokens from padding
-                token_mask = (input_ids > 0).float()  # (B, N, L) - 1 for valid tokens, 0 for padding
-                
                 model = self._get_model()
                 recon_loss, _ = model.decoder.compute_reconstruction_loss(
                     event_latents,
                     input_ids,
                     type_ids,
                     dpe_ids,
-                    mask=token_mask  # Pass token-level mask directly
+                    mask=token_mask  # Pass token-level mask directly (already created above)
                 )
                 
                 total_loss = diff_loss + self.recon_weight * recon_loss
@@ -309,10 +315,12 @@ class EHRDiffusionTrainer:
             mask = batch['mask'].to(self.device)
             
             B, N, L = input_ids.shape
+
+            token_mask = (input_ids > 0).float()
             
             # Encode
             model = self._get_model()
-            event_latents = model.encoder(input_ids, type_ids, dpe_ids)
+            event_latents = model.encoder(input_ids, type_ids, dpe_ids, event_mask=token_mask )
             time_emb = model.time_encoder(con_time)
             joint_latent = torch.cat([event_latents, time_emb], dim=-1)
             
