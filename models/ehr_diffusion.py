@@ -232,7 +232,9 @@ class EHRDiffusionModel(nn.Module):
             std_log_time: Std of log-transformed time (for denormalization)
         
         Returns:
-            decoded_events: dict with keys 'token', 'type', 'dpe', each (B, N, L)
+            decoded_events: dict with keys 'token', 'type', 'dpe', 'mask'
+                - 'token', 'type', 'dpe': (B, N, L) - token IDs (padding positions set to 0)
+                - 'mask': (B, N, L) - predicted mask (1 for valid tokens, 0 for padding)
             decoded_time: (B, N, 1) - continuous time intervals
         """
         # Split event and time latents

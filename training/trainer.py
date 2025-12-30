@@ -214,9 +214,9 @@ class EHRDiffusionTrainer:
             
             # Optional reconstruction loss
             if self.recon_weight > 0:
-                # Decode event latents
-                token_mask = (input_ids.sum(dim=-1) > 0).float()  # (B, N)
-                token_mask_expanded = token_mask.unsqueeze(-1).expand(-1, -1, L)  # (B, N, L)
+                # Create token-level mask: valid tokens are those > 0
+                # This is critical for learning to distinguish valid tokens from padding
+                token_mask = (input_ids > 0).float()  # (B, N, L) - 1 for valid tokens, 0 for padding
                 
                 model = self._get_model()
                 recon_loss, _ = model.decoder.compute_reconstruction_loss(
@@ -224,7 +224,7 @@ class EHRDiffusionTrainer:
                     input_ids,
                     type_ids,
                     dpe_ids,
-                    mask=token_mask_expanded
+                    mask=token_mask  # Pass token-level mask directly
                 )
                 
                 total_loss = diff_loss + self.recon_weight * recon_loss

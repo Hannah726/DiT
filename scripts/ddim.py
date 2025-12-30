@@ -110,10 +110,26 @@ class DDIMSampler:
             denormalize_time=False
         )
         
+        # Apply predicted mask to set padding positions to 0
+        # The decoder now returns 'mask' which indicates valid token positions
+        if 'mask' in decoded_events:
+            predicted_mask = decoded_events['mask']  # (B, N, L) - 1 for valid, 0 for padding
+            predicted_mask_long = predicted_mask.long()  # Convert to long for multiplication
+            
+            # Apply mask: set padding positions to 0
+            token_ids = decoded_events['token'] * predicted_mask_long
+            type_ids = decoded_events['type'] * predicted_mask_long
+            dpe_ids = decoded_events['dpe'] * predicted_mask_long
+        else:
+            # Fallback: if mask not available, use all tokens (backward compatibility)
+            token_ids = decoded_events['token']
+            type_ids = decoded_events['type']
+            dpe_ids = decoded_events['dpe']
+        
         batch_output = {
-            'token': decoded_events['token'].cpu().numpy(),
-            'type': decoded_events['type'].cpu().numpy(),
-            'dpe': decoded_events['dpe'].cpu().numpy(),
+            'token': token_ids.cpu().numpy(),
+            'type': type_ids.cpu().numpy(),
+            'dpe': dpe_ids.cpu().numpy(),
             'time': decoded_time.cpu().numpy()
         }
         
