@@ -170,13 +170,14 @@ class BinnedBoundaryPredictor(nn.Module):
         # Bin classification loss
         bin_logits_flat = bin_logits.view(B * N, -1)
         true_bins_flat = true_bins.view(B * N)
-        bin_loss = F.cross_entropy(bin_logits_flat, true_bins_flat, reduction='none')
+        bin_loss = F.cross_entropy(bin_logits_flat, true_bins_flat, reduction='none')  # (B*N,)
         
         # Regression loss
-        regression_loss = F.mse_loss(predicted_length, true_length.float(), reduction='none')
+        regression_loss = F.mse_loss(predicted_length, true_length.float(), reduction='none')  # (B, N)
+        regression_loss = regression_loss.view(B * N)  # Flatten to (B*N,) to match bin_loss shape
         
         # Combine losses
-        total_loss = bin_loss + regression_loss
+        total_loss = bin_loss + regression_loss  # Both are (B*N,)
         
         if mask is not None:
             mask_flat = mask.view(B * N)

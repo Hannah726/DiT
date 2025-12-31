@@ -111,8 +111,9 @@ class EventDecoder(nn.Module):
             event_latents: (B, N, event_dim) - event latent vectors
             boundary_mask: (B, N, L) - optional boundary constraint mask
                           1 for valid positions, 0 for padding
+                          Used for masking output tokens (not for length inference)
             target_length: (B, N) - optional target length for length-aware decoding
-                          If None, will be inferred from boundary_mask
+                          If provided, enables length-aware decoding and generates boundary_mask
             return_logits: Whether to return raw logits or sampled IDs
         
         Returns:
@@ -130,7 +131,6 @@ class EventDecoder(nn.Module):
         event_h = self.latent_proj(event_latents)  # (B, N, hidden_dim)
         
         # Length-aware decoding: incorporate target length information
-        # Priority: target_length > boundary_mask (inferred) > None
         if target_length is not None:
             # Use target_length directly (preferred)
             length_emb = self.length_embedding(target_length)  # (B, N, hidden_dim)
@@ -139,14 +139,9 @@ class EventDecoder(nn.Module):
             if boundary_mask is None:
                 positions = torch.arange(L, device=target_length.device).unsqueeze(0).unsqueeze(0)
                 boundary_mask = (positions < target_length.unsqueeze(-1)).float()  # (B, N, L)
-        elif boundary_mask is not None:
-            # Infer length from boundary_mask (fallback when target_length is None)
-            inferred_length = boundary_mask.sum(dim=-1).long()  # (B, N)
-            inferred_length = torch.clamp(inferred_length, 0, self.max_token_len)
-            length_emb = self.length_embedding(inferred_length)  # (B, N, hidden_dim)
-            x = self.length_aware_proj(torch.cat([event_h, length_emb], dim=-1))  # (B, N, hidden_dim)
         else:
             # No length information, use event latent only
+            # Note: boundary_mask can still be used for masking output tokens
             x = event_h
         
         # Expand to token level

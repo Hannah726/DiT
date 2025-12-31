@@ -1,5 +1,5 @@
 """
-Trainer for EHR Diffusion Model with Pattern Discovery and BAD
+Trainer for EHR Diffusion Model with Gradient Accumulation
 """
 
 import os
@@ -15,12 +15,17 @@ from models.gaussian_diffusion import TimeAwareGaussianDiffusion
 
 class EHRDiffusionTrainer:
     """
-    Trainer for EHR Diffusion Model
+    Trainer for EHR Diffusion Model with Gradient Accumulation Support
     
     Loss Components:
         1. Diffusion Loss: MSE(predicted_noise, true_noise)
         2. Boundary Loss: CE(predicted_length, true_length)
         3. Reconstruction Loss (optional): Event/Time reconstruction
+    
+    Features:
+        - Gradient Accumulation: Train with large effective batch sizes
+        - Mixed Precision: AMP for faster training
+        - Automatic memory management
     """
     
     def __init__(
@@ -61,12 +66,18 @@ class EHRDiffusionTrainer:
         # Demographics conditioning
         self.use_demographics = config.get('use_demographics', False)
         
+        # ============ GRADIENT ACCUMULATION ============
+        self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+        if self.gradient_accumulation_steps > 1:
+            self.logger.info(f"Using Gradient Accumulation with {self.gradient_accumulation_steps} steps")
+            self.logger.info(f"Effective batch size: {config.get('batch_size', 32) * self.gradient_accumulation_steps}")
+        # ================================================
+        
         # Scheduled sampling for boundary prediction
-        # Gradually transition from true_length to predicted_length during training
         self.scheduled_sampling = config.get('scheduled_sampling', False)
-        self.scheduled_sampling_start = config.get('scheduled_sampling_start', 0.0)  # Start epoch
-        self.scheduled_sampling_end = config.get('scheduled_sampling_end', 0.5)  # End epoch (as fraction of total epochs)
-        self.scheduled_sampling_prob = 1.0  # Will be updated during training
+        self.scheduled_sampling_start = config.get('scheduled_sampling_start', 0.0)
+        self.scheduled_sampling_end = config.get('scheduled_sampling_end', 0.5)
+        self.scheduled_sampling_prob = 1.0
         
         self.use_amp = config.get('use_amp', False)
         if self.use_amp:
@@ -79,9 +90,13 @@ class EHRDiffusionTrainer:
                 config=config
             )
     
-    def train_step(self, batch):
+    def train_step(self, batch, accumulation_step):
         """
-        Single training step
+        Single training step with gradient accumulation support
+        
+        Args:
+            batch: Input batch
+            accumulation_step: Current step in accumulation cycle (0-indexed)
         
         Returns:
             loss_dict: Dictionary of loss components
@@ -117,19 +132,13 @@ class EHRDiffusionTrainer:
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
             
             noise = torch.randn_like(joint_latent)
-            # Get actual noise used (scaled for time if using TimeAwareGaussianDiffusion)
             if isinstance(self.diffusion, TimeAwareGaussianDiffusion):
                 noisy_latent, actual_noise = self.diffusion.q_sample(joint_latent, t, noise=noise, return_noise=True)
             else:
                 noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
                 actual_noise = noise
             
-            # event_level_mask is now returned from encode() (optimization to avoid redundant computation)
-            
-            # DiT will handle prompts expansion internally (optimization)
             prompts_for_dit = model.pattern_prompts.prompts if model.use_prompts else None
-            
-            # Use demographics conditionally based on config
             condition = demographics if self.use_demographics else None
             predicted_noise = model.dit(
                 noisy_latent, t,
@@ -138,23 +147,19 @@ class EHRDiffusionTrainer:
                 mask=event_level_mask
             )
             
-            # Use actual_noise (scaled for time) for loss calculation
             diff_loss = F.mse_loss(
                 predicted_noise * event_level_mask.unsqueeze(-1),
                 actual_noise * event_level_mask.unsqueeze(-1),
                 reduction='sum'
             ) / event_level_mask.sum()
             
-            # Boundary prediction from denoised latent
             predicted_x0 = self.diffusion.predict_start_from_noise(
                 noisy_latent, t, predicted_noise
             )
             denoised_event_latent = predicted_x0[..., :model.pattern_dim]
             
-            # BinnedBoundaryPredictor returns: (bin_logits, bin_probs, predicted_length)
             bin_logits, bin_probs, predicted_length = model.boundary_predictor(denoised_event_latent)
             
-            # Compute hybrid loss (bin classification + regression)
             boundary_loss = model.boundary_predictor.compute_loss(
                 bin_logits,
                 predicted_length,
@@ -162,11 +167,9 @@ class EHRDiffusionTrainer:
                 mask=event_level_mask
             )
             
-            # Scheduled sampling
             if self.scheduled_sampling:
                 predicted_length_rounded = torch.round(predicted_length).long()
                 predicted_length_rounded = torch.clamp(predicted_length_rounded, 11, 128)
-                
                 use_predicted = torch.rand(B, device=self.device) < self.scheduled_sampling_prob
                 boundary_length_for_mask = torch.where(
                     use_predicted.unsqueeze(-1),
@@ -178,31 +181,26 @@ class EHRDiffusionTrainer:
             
             recon_loss = 0.0
             if self.recon_weight > 0:
-                # Apply BAD constraint during training: use scheduled sampling for boundary_mask
                 B, N = boundary_length_for_mask.shape
                 L = model.event_decoder.max_token_len
                 positions = torch.arange(L, device=self.device).unsqueeze(0).unsqueeze(0)
                 boundary_mask_train = (positions < boundary_length_for_mask.unsqueeze(-1)).float()
-                
-                # Combine event_mask and boundary_mask for reconstruction loss
                 combined_mask = event_mask * boundary_mask_train
                 
-                # Use denoised latents from predicted_x0 for reconstruction loss (consistent with boundary prediction)
-                # Extract event and time latents from predicted_x0
                 denoised_event_latent_for_recon = predicted_x0[..., :model.pattern_dim]
                 denoised_time_latent_for_recon = predicted_x0[..., model.pattern_dim:2*model.pattern_dim]
                 
                 event_recon_loss, _ = model.event_decoder.compute_reconstruction_loss(
-                    denoised_event_latent_for_recon,  # Use denoised event latent from predicted_x0
+                    denoised_event_latent_for_recon,
                     input_ids,
                     type_ids,
                     dpe_ids,
-                    mask=combined_mask,  # Use combined mask with BAD constraint
-                    target_length=boundary_length_for_mask  # Length-aware decoding with scheduled sampling
+                    mask=combined_mask,
+                    target_length=boundary_length_for_mask
                 )
                 
                 time_recon_loss, _ = model.time_decoder.compute_reconstruction_loss(
-                    denoised_time_latent_for_recon,  # Use denoised time latent from predicted_x0
+                    denoised_time_latent_for_recon,
                     con_time,
                     mask=event_level_mask
                 )
@@ -210,28 +208,41 @@ class EHRDiffusionTrainer:
                 recon_loss = event_recon_loss + time_recon_loss
             
             total_loss = diff_loss + self.boundary_weight * boundary_loss + self.recon_weight * recon_loss
+            
+            # ============ GRADIENT ACCUMULATION ============
+            # Scale loss by accumulation steps
+            total_loss = total_loss / self.gradient_accumulation_steps
+            # ================================================
         
-        self.optimizer.zero_grad()
-        
+        # ============ GRADIENT ACCUMULATION BACKWARD ============
         if self.use_amp:
             self.scaler.scale(total_loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
         else:
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
-            self.optimizer.step()
         
-        if self.scheduler is not None:
-            self.scheduler.step()
+        # Only step optimizer every N accumulation steps
+        is_accumulation_step = (accumulation_step + 1) % self.gradient_accumulation_steps == 0
+        
+        if is_accumulation_step:
+            if self.use_amp:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
+                self.optimizer.step()
+            
+            self.optimizer.zero_grad()
+            
+            if self.scheduler is not None:
+                self.scheduler.step()
+        # =========================================================
         
         # Metrics: round predicted_length for comparison
         predicted_length_int = torch.round(predicted_length).long()
         predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
         
-        # Add epsilon to avoid division by zero
         mask_sum = event_level_mask.sum() + 1e-8
         
         boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / mask_sum
@@ -253,8 +264,9 @@ class EHRDiffusionTrainer:
         avg_predicted_length = (predicted_length_int.float() * event_level_mask).sum() / mask_sum
         avg_true_length = (true_length.float() * event_level_mask).sum() / mask_sum
         
+        # ============ SCALE BACK LOSS FOR LOGGING ============
         loss_dict = {
-            'total_loss': total_loss.item(),
+            'total_loss': (total_loss * self.gradient_accumulation_steps).item(),
             'diff_loss': diff_loss.item(),
             'boundary_loss': boundary_loss.item(),
             'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else recon_loss,
@@ -264,12 +276,13 @@ class EHRDiffusionTrainer:
             'avg_predicted_length': avg_predicted_length.item(),
             'avg_true_length': avg_true_length.item()
         }
+        # =====================================================
         
         return loss_dict
     
     @torch.no_grad()
     def val_step(self, batch):
-        """Validation step"""
+        """Validation step (unchanged)"""
         self.model.eval()
         
         input_ids = batch['input_ids'].to(self.device)
@@ -299,19 +312,14 @@ class EHRDiffusionTrainer:
         B = joint_latent.shape[0]
         t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
         noise = torch.randn_like(joint_latent)
-        # Get actual noise used (scaled for time if using TimeAwareGaussianDiffusion)
+        
         if isinstance(self.diffusion, TimeAwareGaussianDiffusion):
             noisy_latent, actual_noise = self.diffusion.q_sample(joint_latent, t, noise=noise, return_noise=True)
         else:
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
             actual_noise = noise
         
-        # event_level_mask is now returned from encode() (optimization to avoid redundant computation)
-        
-        # DiT will handle prompts expansion internally (optimization)
         prompts_for_dit = model.pattern_prompts.prompts if model.use_prompts else None
-        
-        # Use demographics conditionally based on config
         condition = demographics if self.use_demographics else None
         predicted_noise = model.dit(
             noisy_latent, t,
@@ -320,7 +328,6 @@ class EHRDiffusionTrainer:
             mask=event_level_mask
         )
         
-        # Use actual_noise (scaled for time) for loss calculation
         diff_loss = F.mse_loss(
             predicted_noise * event_level_mask.unsqueeze(-1),
             actual_noise * event_level_mask.unsqueeze(-1),
@@ -346,7 +353,6 @@ class EHRDiffusionTrainer:
         predicted_length_int = torch.round(predicted_length).long()
         predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
         
-        # Add epsilon to avoid division by zero
         mask_sum = event_level_mask.sum() + 1e-8
         
         boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / mask_sum
@@ -376,32 +382,37 @@ class EHRDiffusionTrainer:
         return loss_dict
     
     def train_epoch(self):
-        """Train for one epoch"""
+        """Train for one epoch with gradient accumulation"""
         metric_logger = MetricLogger(delimiter="  ")
         
-        # Update scheduled sampling probability
         if self.scheduled_sampling:
             total_epochs = self.config.get('epochs', 100)
             start_epoch = int(self.scheduled_sampling_start * total_epochs)
             end_epoch = int(self.scheduled_sampling_end * total_epochs)
             
             if self.current_epoch < start_epoch:
-                self.scheduled_sampling_prob = 0.0  # Always use true_length
+                self.scheduled_sampling_prob = 0.0
             elif self.current_epoch >= end_epoch:
-                self.scheduled_sampling_prob = 1.0  # Always use predicted_length
+                self.scheduled_sampling_prob = 1.0
             else:
-                # Linear interpolation between start and end
                 progress = (self.current_epoch - start_epoch) / (end_epoch - start_epoch)
                 self.scheduled_sampling_prob = progress
         
+        # ============ GRADIENT ACCUMULATION LOOP ============
+        accumulation_step = 0
         for batch in tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}", disable=self.rank != 0):
-            loss_dict = self.train_step(batch)
+            loss_dict = self.train_step(batch, accumulation_step)
             metric_logger.update(**loss_dict)
             
-            self.global_step += 1
+            # Only increment global_step after actual optimizer step
+            if (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
+                self.global_step += 1
+                
+                if self.use_wandb and self.rank == 0 and self.global_step % self.config['log_interval'] == 0:
+                    wandb.log({f'train/{k}': v for k, v in loss_dict.items()}, step=self.global_step)
             
-            if self.use_wandb and self.rank == 0 and self.global_step % self.config['log_interval'] == 0:
-                wandb.log({f'train/{k}': v for k, v in loss_dict.items()}, step=self.global_step)
+            accumulation_step += 1
+        # ====================================================
         
         if self.rank == 0:
             self.logger.info(f"Train Epoch {self.current_epoch}: {metric_logger}")
@@ -410,7 +421,7 @@ class EHRDiffusionTrainer:
     
     @torch.no_grad()
     def validate(self):
-        """Validate on validation set"""
+        """Validate on validation set (unchanged)"""
         metric_logger = MetricLogger(delimiter="  ")
         
         for batch in tqdm(self.val_loader, desc="Validation", disable=self.rank != 0):
@@ -426,7 +437,7 @@ class EHRDiffusionTrainer:
         return metric_logger.get_dict()
     
     def save_checkpoint(self, is_best=False):
-        """Save checkpoint"""
+        """Save checkpoint (unchanged)"""
         if self.rank != 0:
             return
         
@@ -456,7 +467,7 @@ class EHRDiffusionTrainer:
             self.logger.info(f"Saved best checkpoint to {best_path}")
     
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint"""
+        """Load checkpoint (unchanged)"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         model = self.model.module if hasattr(self.model, 'module') else self.model
@@ -474,7 +485,7 @@ class EHRDiffusionTrainer:
         self.logger.info(f"Resuming from epoch {self.current_epoch}, step {self.global_step}")
     
     def train(self):
-        """Main training loop"""
+        """Main training loop (unchanged)"""
         for epoch in range(self.current_epoch, self.config['epochs']):
             self.current_epoch = epoch
             
@@ -490,4 +501,4 @@ class EHRDiffusionTrainer:
             if epoch % self.config['save_interval'] == 0:
                 self.save_checkpoint(is_best=False)
         
-        self.logger.info("Training completed!")
+        self.logger.info("Training completed.")

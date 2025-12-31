@@ -110,10 +110,10 @@ class EHRDiffusionModel(nn.Module):
         )
         
         # Boundary predictor now takes event_refined as input (not boundary_emb)
+        # Note: BinnedBoundaryPredictor doesn't need max_len (bins are fixed: [11, 128])
         self.boundary_predictor = SimpleBoundaryPredictor(
             input_dim=pattern_dim,  # Takes event_refined (pattern_dim) as input
             hidden_dim=128,
-            max_len=max_token_len,
             dropout=dropout
         )
         

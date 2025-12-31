@@ -1,0 +1,31 @@
+#!/bin/bash
+#PBS -N memory_profile
+#PBS -q normal
+#PBS -l select=1:ncpus=4:mem=64GB:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -j oe
+
+cd /home/users/nus/e1582377/RawDiff
+source ~/miniconda3/bin/activate rawdit
+
+export PYTHONUNBUFFERED=1
+export CUDA_VISIBLE_DEVICES=0
+
+# 确保logs目录存在
+mkdir -p logs
+
+LOG_FILE="logs/memory_profile_$(date +%Y%m%d_%H%M%S).log"
+
+echo "Starting memory profiling at $(date)"
+echo "Output: ${LOG_FILE}"
+
+python -u profile_memory.py > "${LOG_FILE}" 2>&1
+
+echo "Profiling completed at $(date)"
+echo "Results saved to: ${LOG_FILE}"
+
+# 显示关键结果
+echo ""
+echo "==================== KEY RESULTS ===================="
+grep -E "(batch_size=|PASSED|OOM|SUMMARY|Safe batch)" "${LOG_FILE}"
+echo "====================================================="

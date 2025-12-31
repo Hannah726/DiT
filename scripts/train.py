@@ -82,6 +82,8 @@ def parse_args():
                        help='Weight decay')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                        help='Gradient clipping value')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                       help='Number of gradient accumulation steps (effective batch size = batch_size * gradient_accumulation_steps)')
     parser.add_argument('--warmup_steps', type=int, default=1000,
                        help='Number of warmup steps')
     
@@ -341,7 +343,10 @@ def main():
     optimizer = create_optimizer(model, args)
     
     # Create scheduler
-    num_training_steps = len(train_loader) * args.epochs
+    # Calculate number of training steps considering gradient accumulation
+    # Actual optimizer steps = (batches per epoch / accumulation_steps) * epochs
+    gradient_accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
+    num_training_steps = (len(train_loader) // gradient_accumulation_steps) * args.epochs
     scheduler = create_scheduler(optimizer, args, num_training_steps)
     
     # Training config
@@ -351,6 +356,7 @@ def main():
         'lr': args.lr,
         'weight_decay': args.weight_decay,
         'grad_clip': args.grad_clip,
+        'gradient_accumulation_steps': args.gradient_accumulation_steps,
         'use_amp': args.use_amp,
         'log_interval': args.log_interval,
         'val_interval': args.val_interval,
