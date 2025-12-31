@@ -147,49 +147,35 @@ class EHRDiffusionTrainer:
                 reduction='sum'
             ) / event_level_mask.sum()
             
-            # Boundary prediction from denoised latent (consistent with inference)
-            # During inference, boundary is predicted from fully denoised joint_latent (after complete DDIM sampling)
-            # During training, we should also predict boundary from denoised latent to maintain consistency
-            # However, we use predicted_x0 (single-step prediction) which is an approximation of fully denoised latent
-            # Predict x_0 from noisy latent and predicted noise
+            # Boundary prediction from denoised latent
             predicted_x0 = self.diffusion.predict_start_from_noise(
                 noisy_latent, t, predicted_noise
             )
-            # Extract event_latent from predicted_x0 (first pattern_dim dimensions)
-            # This is the denoised event latent from single-step prediction
-            # Note: This is consistent with inference where boundary is predicted from fully denoised joint_latent
-            # The predicted_x0 is an approximation that becomes more accurate as training progresses
             denoised_event_latent = predicted_x0[..., :model.pattern_dim]
-            # Predict boundary from denoised event latent (same as inference)
-            length_logits, length_dist = model.predict_boundary(denoised_event_latent)
             
+            # BinnedBoundaryPredictor returns: (bin_logits, bin_probs, predicted_length)
+            bin_logits, bin_probs, predicted_length = model.boundary_predictor(denoised_event_latent)
+            
+            # Compute hybrid loss (bin classification + regression)
             boundary_loss = model.boundary_predictor.compute_loss(
-                length_logits,
-                true_length,
+                bin_logits,
+                predicted_length,
+                true_length.float(),
                 mask=event_level_mask
             )
             
-            # Scheduled sampling: gradually transition from true_length to predicted_length
+            # Scheduled sampling
             if self.scheduled_sampling:
-                # Sample predicted length
-                # Use soft boundary sampling during training for robustness
-                predicted_length = model.boundary_predictor.sample_length(
-                    length_dist,
-                    deterministic=False,  # Use sampling during training
-                    temperature=1.0,
-                    soft_boundary=True,  # Use top-k sampling for robustness
-                    top_k=3  # Consider top-3 candidates
-                )
-                # Decide whether to use true_length or predicted_length
+                predicted_length_rounded = torch.round(predicted_length).long()
+                predicted_length_rounded = torch.clamp(predicted_length_rounded, 11, 128)
+                
                 use_predicted = torch.rand(B, device=self.device) < self.scheduled_sampling_prob
-                # Use predicted_length where scheduled, true_length otherwise
                 boundary_length_for_mask = torch.where(
                     use_predicted.unsqueeze(-1),
-                    predicted_length,
+                    predicted_length_rounded,
                     true_length
                 )
             else:
-                # Always use true_length (no scheduled sampling)
                 boundary_length_for_mask = true_length
             
             recon_loss = 0.0
@@ -243,11 +229,27 @@ class EHRDiffusionTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
         
-        predicted_length = length_logits.argmax(dim=-1)
-        boundary_accuracy = ((predicted_length == true_length).float() * event_level_mask).sum() / event_level_mask.sum()
-        boundary_mae = (torch.abs(predicted_length - true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        # Metrics: round predicted_length for comparison
+        predicted_length_int = torch.round(predicted_length).long()
+        predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
         
-        avg_predicted_length = (predicted_length.float() * event_level_mask).sum() / event_level_mask.sum()
+        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        
+        # Bin accuracy
+        true_bins = torch.zeros_like(true_length)
+        bin_edges = model.boundary_predictor.bin_edges
+        for i in range(model.boundary_predictor.num_bins):
+            if i == model.boundary_predictor.num_bins - 1:
+                bin_mask = (true_length >= bin_edges[i]) & (true_length <= bin_edges[i+1])
+            else:
+                bin_mask = (true_length >= bin_edges[i]) & (true_length < bin_edges[i+1])
+            true_bins[bin_mask] = i
+        
+        predicted_bins = torch.argmax(bin_logits, dim=-1)
+        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / event_level_mask.sum()
+        
+        avg_predicted_length = (predicted_length_int.float() * event_level_mask).sum() / event_level_mask.sum()
         avg_true_length = (true_length.float() * event_level_mask).sum() / event_level_mask.sum()
         
         loss_dict = {
@@ -257,6 +259,7 @@ class EHRDiffusionTrainer:
             'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else recon_loss,
             'boundary_accuracy': boundary_accuracy.item(),
             'boundary_mae': boundary_mae.item(),
+            'bin_accuracy': bin_accuracy.item(),
             'avg_predicted_length': avg_predicted_length.item(),
             'avg_true_length': avg_true_length.item()
         }
@@ -325,34 +328,47 @@ class EHRDiffusionTrainer:
             reduction='sum'
         ) / event_level_mask.sum()
         
-        # Boundary prediction from denoised latent (consistent with inference)
-        # Predict x_0 from noisy latent and predicted noise
         predicted_x0 = self.diffusion.predict_start_from_noise(
             noisy_latent, t, predicted_noise
         )
-        # Extract event_latent from predicted_x0 (first pattern_dim dimensions)
         predicted_event_latent = predicted_x0[..., :model.pattern_dim]
-        # Predict boundary from denoised event latent
-        length_logits, _ = model.predict_boundary(predicted_event_latent)
+        
+        bin_logits, bin_probs, predicted_length = model.boundary_predictor(predicted_event_latent)
         
         boundary_loss = model.boundary_predictor.compute_loss(
-            length_logits,
-            true_length,
+            bin_logits,
+            predicted_length,
+            true_length.float(),
             mask=event_level_mask
         )
         
         total_loss = diff_loss + self.boundary_weight * boundary_loss
         
-        predicted_length = length_logits.argmax(dim=-1)
-        boundary_accuracy = ((predicted_length == true_length).float() * event_level_mask).sum() / event_level_mask.sum()
-        boundary_mae = (torch.abs(predicted_length - true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        predicted_length_int = torch.round(predicted_length).long()
+        predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
+        
+        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        
+        true_bins = torch.zeros_like(true_length)
+        bin_edges = model.boundary_predictor.bin_edges
+        for i in range(model.boundary_predictor.num_bins):
+            if i == model.boundary_predictor.num_bins - 1:
+                bin_mask = (true_length >= bin_edges[i]) & (true_length <= bin_edges[i+1])
+            else:
+                bin_mask = (true_length >= bin_edges[i]) & (true_length < bin_edges[i+1])
+            true_bins[bin_mask] = i
+        
+        predicted_bins = torch.argmax(bin_logits, dim=-1)
+        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / event_level_mask.sum()
         
         loss_dict = {
             'total_loss': total_loss.item(),
             'diff_loss': diff_loss.item(),
             'boundary_loss': boundary_loss.item(),
             'boundary_accuracy': boundary_accuracy.item(),
-            'boundary_mae': boundary_mae.item()
+            'boundary_mae': boundary_mae.item(),
+            'bin_accuracy': bin_accuracy.item()
         }
         
         return loss_dict

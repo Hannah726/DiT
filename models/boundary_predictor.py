@@ -1,40 +1,42 @@
-"""
-Simple Boundary Predictor
-Predicts sequence length directly from boundary latent
-"""
+# models/boundary_predictor.py
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SimpleBoundaryPredictor(nn.Module):
+class BinnedBoundaryPredictor(nn.Module):
     """
-    Simple Boundary (Length) Predictor
-    
-    Predicts: P(length | event_refined) for each event
-    
-    Args:
-        input_dim: Input dimension (event_refined dimension, typically pattern_dim)
-        hidden_dim: MLP hidden dimension
-        max_len: Maximum sequence length
-        dropout: Dropout rate
+    Two-stage boundary prediction:
+    Stage 1: Coarse binning (6 bins) - easy classification
+    Stage 2: Fine-grained offset regression within bin
     """
     
     def __init__(
         self,
-        input_dim: int = 96,  # Changed from boundary_dim to input_dim (pattern_dim)
+        input_dim: int = 96,
         hidden_dim: int = 128,
-        max_len: int = 128,
         dropout: float = 0.1
     ):
         super().__init__()
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.max_len = max_len
         
-        self.predictor = nn.Sequential(
+        # Bin edges (6 bins covering [11, 128])
+        self.register_buffer('bin_edges', torch.tensor([11, 30, 45, 60, 80, 100, 128]))
+        self.num_bins = 6
+        
+        # Bin centers for initial prediction
+        bin_centers = [(self.bin_edges[i] + self.bin_edges[i+1]) / 2 for i in range(self.num_bins)]
+        self.register_buffer('bin_centers', torch.tensor(bin_centers))
+        
+        # Bin widths for offset normalization
+        bin_widths = [self.bin_edges[i+1] - self.bin_edges[i] for i in range(self.num_bins)]
+        self.register_buffer('bin_widths', torch.tensor(bin_widths))
+        
+        # Stage 1: Bin classifier (6-way classification)
+        self.bin_classifier = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
@@ -43,7 +45,19 @@ class SimpleBoundaryPredictor(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, max_len + 1)
+            nn.Linear(hidden_dim, self.num_bins)
+        )
+        
+        # Stage 2: Offset regressor (continuous within bin)
+        self.offset_regressor = nn.Sequential(
+            nn.Linear(input_dim + self.num_bins, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+            nn.Tanh()  # Output in [-1, 1]
         )
         
         self.apply(self._init_weights)
@@ -62,65 +76,67 @@ class SimpleBoundaryPredictor(nn.Module):
     def forward(self, event_refined):
         """
         Args:
-            event_refined: (B, N, input_dim) - refined event latents (from PatternDiscoveryPrompts)
+            event_refined: (B, N, input_dim)
         
         Returns:
-            length_logits: (B, N, max_len+1) - raw logits
-            length_dist: (B, N, max_len+1) - probability distribution
+            length_logits: (B, N, num_bins) - bin logits for compatibility
+            length_dist: (B, N, num_bins) - bin probabilities
+            predicted_length: (B, N) - continuous length prediction
         """
-        length_logits = self.predictor(event_refined)
-        length_dist = F.softmax(length_logits, dim=-1)
+        B, N, _ = event_refined.shape
         
-        return length_logits, length_dist
+        # Stage 1: Predict bin
+        bin_logits = self.bin_classifier(event_refined)  # (B, N, 6)
+        bin_probs = F.softmax(bin_logits, dim=-1)
+        bin_pred = torch.argmax(bin_probs, dim=-1)  # (B, N)
+        
+        # Stage 2: Predict offset within bin
+        bin_onehot = F.one_hot(bin_pred, num_classes=self.num_bins).float()
+        offset_input = torch.cat([event_refined, bin_onehot], dim=-1)
+        offset_normalized = self.offset_regressor(offset_input).squeeze(-1)  # (B, N) in [-1, 1]
+        
+        # Combine: length = bin_center + offset * (bin_width / 2)
+        bin_centers = self.bin_centers[bin_pred]  # (B, N)
+        bin_widths = self.bin_widths[bin_pred]  # (B, N)
+        
+        predicted_length = bin_centers + offset_normalized * (bin_widths / 2.0)
+        predicted_length = torch.clamp(predicted_length, 11, 128)
+        
+        return bin_logits, bin_probs, predicted_length
     
     def sample_length(self, length_dist, temperature=1.0, deterministic=False, 
                      soft_boundary=False, top_k=3):
         """
-        Sample or select sequence length with optional soft boundary
+        Sample length from distribution
         
         Args:
-            length_dist: (B, N, max_len+1) - probability distribution
-            temperature: Sampling temperature (lower = more deterministic)
-            deterministic: If True, use argmax
-            soft_boundary: If True, use top-k sampling for robustness
-                          This provides uncertainty and avoids hard truncation
-            top_k: Number of top candidates to consider in soft boundary mode
+            length_dist: (B, N, num_bins) - bin probabilities
+            temperature: Sampling temperature
+            deterministic: Use argmax
+            soft_boundary: Use top-k sampling
+            top_k: Number of top bins to sample from
         
         Returns:
-            (B, N) - predicted lengths [0, max_len]
+            (B, N) - sampled bin indices (not actual lengths!)
         """
         if deterministic:
             return torch.argmax(length_dist, dim=-1)
         
         if soft_boundary:
-            # Soft boundary: sample from top-k candidates
-            # This provides robustness against single-point failures
-            # and increases length uncertainty for better generalization
-            B, N, L = length_dist.shape
-            
-            # Get top-k candidates
-            topk_probs, topk_indices = torch.topk(length_dist, k=min(top_k, L), dim=-1)
-            # Renormalize top-k probabilities
+            B, N, _ = length_dist.shape
+            topk_probs, topk_indices = torch.topk(length_dist, k=min(top_k, self.num_bins), dim=-1)
             topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-10)
             
-            # Sample from top-k (with temperature)
             logits = torch.log(topk_probs + 1e-10) / temperature
             probs = F.softmax(logits, dim=-1)
             
-            # Sample indices in top-k space
             probs_flat = probs.view(B * N, -1)
-            sampled_topk_idx = torch.multinomial(
-                probs_flat, 
-                num_samples=1
-            ).squeeze(-1)  # (B*N,)
-            
-            # Map back to original length space
+            sampled_topk_idx = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)
             sampled_topk_idx = sampled_topk_idx.view(B, N, 1)
             samples = torch.gather(topk_indices, -1, sampled_topk_idx).squeeze(-1)
             
             return samples
         else:
-            # Standard sampling from full distribution
             logits = torch.log(length_dist + 1e-10) / temperature
             B, N, L = logits.shape
             
@@ -130,32 +146,51 @@ class SimpleBoundaryPredictor(nn.Module):
             
             return samples.view(B, N)
     
-    def compute_loss(self, length_logits, true_length, mask=None):
+    def compute_loss(self, bin_logits, predicted_length, true_length, mask=None):
         """
-        Cross-entropy loss for length prediction
+        Hybrid loss: bin classification + regression
         
         Args:
-            length_logits: (B, N, max_len+1) - predicted logits
-            true_length: (B, N) - ground truth lengths [0, max_len]
+            bin_logits: (B, N, num_bins)
+            predicted_length: (B, N) - continuous prediction
+            true_length: (B, N) - ground truth
             mask: (B, N) - valid event mask
         
         Returns:
-            loss: Scalar loss
+            total_loss: Scalar loss
         """
         B, N = true_length.shape
         
-        logits_flat = length_logits.view(B * N, -1)
-        targets_flat = true_length.view(B * N)
+        # Get true bin for each length
+        true_bins = torch.zeros_like(true_length, dtype=torch.long)
+        for i in range(self.num_bins):
+            if i == self.num_bins - 1:
+                # Last bin: include upper bound
+                bin_mask = (true_length >= self.bin_edges[i]) & (true_length <= self.bin_edges[i+1])
+            else:
+                bin_mask = (true_length >= self.bin_edges[i]) & (true_length < self.bin_edges[i+1])
+            true_bins[bin_mask] = i
         
-        loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+        # Bin classification loss
+        bin_logits_flat = bin_logits.view(B * N, -1)
+        true_bins_flat = true_bins.view(B * N)
+        bin_loss = F.cross_entropy(bin_logits_flat, true_bins_flat, reduction='none')
+        
+        # Regression loss
+        regression_loss = F.mse_loss(predicted_length, true_length.float(), reduction='none')
+        
+        # Combine losses
+        total_loss = bin_loss + regression_loss
         
         if mask is not None:
             mask_flat = mask.view(B * N)
-            loss = (loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
+            total_loss = (total_loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
         else:
-            loss = loss.mean()
+            total_loss = total_loss.mean()
         
-        return loss
+        return total_loss
 
 
-BoundaryDistributionPredictor = SimpleBoundaryPredictor
+# Alias for backward compatibility
+SimpleBoundaryPredictor = BinnedBoundaryPredictor
+BoundaryDistributionPredictor = BinnedBoundaryPredictor

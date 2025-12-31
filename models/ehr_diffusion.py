@@ -236,10 +236,11 @@ class EHRDiffusionModel(nn.Module):
             event_refined: (B, N, pattern_dim) - refined event latents
         
         Returns:
-            length_logits: (B, N, max_len+1)
-            length_dist: (B, N, max_len+1)
+            length_logits: (B, N, num_bins) - bin classification logits
+            length_dist: (B, N, num_bins) - bin probabilities
         """
-        return self.boundary_predictor(event_refined)
+        bin_logits, bin_probs, _ = self.boundary_predictor(event_refined)
+        return bin_logits, bin_probs
     
     def decode_joint_latent(self, joint_latent, return_logits=False, 
                            deterministic_boundary=True, soft_boundary=False, 
@@ -261,20 +262,17 @@ class EHRDiffusionModel(nn.Module):
             predicted_length: (B, N)
             boundary_mask: (B, N, L)
         """
-        # Split joint latent (no boundary in it anymore)
+        # Split joint latent
         event_latent = joint_latent[..., :self.pattern_dim]
         time_latent = joint_latent[..., self.pattern_dim:2*self.pattern_dim]
         
         # Predict boundary from denoised event_latent
-        length_logits, length_dist = self.predict_boundary(event_latent)
+        # BinnedBoundaryPredictor returns: (bin_logits, bin_probs, predicted_length)
+        bin_logits, bin_probs, predicted_length = self.boundary_predictor(event_latent)
         
-        predicted_length = self.boundary_predictor.sample_length(
-            length_dist,
-            temperature=boundary_temperature,
-            deterministic=deterministic_boundary,
-            soft_boundary=soft_boundary,
-            top_k=top_k
-        )
+        # Round to nearest integer
+        predicted_length = torch.round(predicted_length).long()
+        predicted_length = torch.clamp(predicted_length, 11, 128)
         
         B, N = predicted_length.shape
         L = self.event_decoder.max_token_len
@@ -285,7 +283,7 @@ class EHRDiffusionModel(nn.Module):
         decoded_events = self.event_decoder(
             event_latent,
             boundary_mask=boundary_mask,
-            target_length=predicted_length,  # Length-aware decoding
+            target_length=predicted_length,
             return_logits=return_logits
         )
         
