@@ -335,7 +335,8 @@ class DiT(nn.Module):
             x: (B, N, latent_dim) - noisy latent codes
             t: (B,) - timestep indices
             condition: (B, condition_dim) - demographics
-            prompts: (B, P, 96) - pattern prompts (optional)
+            prompts: (P, dim) or (B, P, dim) - pattern prompts (optional)
+                     If shape is (P, dim), will be expanded to (B, P, dim) internally
             mask: (B, N) - valid event mask
             
         Returns:
@@ -357,8 +358,12 @@ class DiT(nn.Module):
         else:
             c = t_emb
         
-        # Project prompts if using them
+        # Handle prompts: expand if needed (optimization to avoid redundant expand in trainer)
         if self.use_prompts and prompts is not None:
+            if prompts.dim() == 2:
+                # Prompts shape: (P, dim) - expand to (B, P, dim)
+                prompts = prompts.unsqueeze(0).expand(B, -1, -1)
+            # Now prompts is (B, P, dim)
             prompts = self.prompt_proj(prompts)  # (B, P, hidden_dim)
         
         # Apply transformer blocks

@@ -164,6 +164,7 @@ class EHRDiffusionModel(nn.Module):
             time_refined: (B, N, 96)
             prompt_weights: (B, N, K)
             true_length: (B, N) - ground truth lengths
+            event_level_mask: (B, N) - valid event mask (1 for valid, 0 for padding)
         """
         event_latent = self.event_encoder(
             input_ids, type_ids, dpe_ids,
@@ -172,20 +173,19 @@ class EHRDiffusionModel(nn.Module):
         
         time_emb = self.time_encoder(con_time)
         
+        # Compute event_level_mask and true_length (avoid redundant computation)
         if event_mask is not None:
-            event_level_mask = (event_mask.sum(dim=-1) > 0).float()
+            event_mask_sum = event_mask.sum(dim=-1)  # (B, N) - compute once
+            event_level_mask = (event_mask_sum > 0).float()  # (B, N)
+            true_length = event_mask_sum.long()  # (B, N)
         else:
             event_level_mask = None
+            true_length = (input_ids > 0).sum(dim=-1).long()
         
         event_refined, time_refined, prompt_weights = self.pattern_prompts(
             event_latent, time_emb,
             mask=event_level_mask
         )
-        
-        if event_mask is not None:
-            true_length = event_mask.sum(dim=-1).long()
-        else:
-            true_length = (input_ids > 0).sum(dim=-1).long()
         
         # Joint latent only contains event_refined + time_refined
         # Boundary is NOT included in diffusion process
@@ -194,7 +194,7 @@ class EHRDiffusionModel(nn.Module):
             time_refined
         ], dim=-1)
         
-        return joint_latent, event_refined, time_refined, prompt_weights, true_length
+        return joint_latent, event_refined, time_refined, prompt_weights, true_length, event_level_mask
     
     def decode(self, event_latent, boundary_mask=None, target_length=None, return_logits=False):
         """
@@ -274,18 +274,20 @@ class EHRDiffusionModel(nn.Module):
         predicted_length = torch.round(predicted_length).long()
         predicted_length = torch.clamp(predicted_length, 11, 128)
         
+        # Use length-aware decoding with predicted_length
+        # EventDecoder will generate boundary_mask internally from target_length
+        decoded_events = self.event_decoder(
+            event_latent,
+            boundary_mask=None,  # Will be generated from target_length in EventDecoder
+            target_length=predicted_length,
+            return_logits=return_logits
+        )
+        
+        # Generate boundary_mask for return value (for consistency)
         B, N = predicted_length.shape
         L = self.event_decoder.max_token_len
         positions = torch.arange(L, device=predicted_length.device).unsqueeze(0).unsqueeze(0)
         boundary_mask = (positions < predicted_length.unsqueeze(-1)).float()
-        
-        # Use length-aware decoding with predicted_length
-        decoded_events = self.event_decoder(
-            event_latent,
-            boundary_mask=boundary_mask,
-            target_length=predicted_length,
-            return_logits=return_logits
-        )
         
         decoded_time = self.time_decoder(time_latent)
         
@@ -297,7 +299,7 @@ class EHRDiffusionModel(nn.Module):
         """
         token_mask = (input_ids > 0).float()
         
-        joint_latent, event_refined, time_refined, prompt_weights, true_length = self.encode(
+        joint_latent, event_refined, time_refined, prompt_weights, true_length, _ = self.encode(
             input_ids, type_ids, dpe_ids, con_time,
             event_mask=token_mask
         )

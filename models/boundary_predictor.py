@@ -36,12 +36,9 @@ class BinnedBoundaryPredictor(nn.Module):
         self.register_buffer('bin_widths', torch.tensor(bin_widths))
         
         # Stage 1: Bin classifier (6-way classification)
+        # Simplified to 2 layers: input_dim -> hidden_dim -> num_bins
         self.bin_classifier = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -49,14 +46,13 @@ class BinnedBoundaryPredictor(nn.Module):
         )
         
         # Stage 2: Offset regressor (continuous within bin)
+        # Simplified to 2 layers: (input_dim + num_bins) -> hidden_dim -> 1
         self.offset_regressor = nn.Sequential(
             nn.Linear(input_dim + self.num_bins, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
+            nn.Linear(hidden_dim, 1),
             nn.Tanh()  # Output in [-1, 1]
         )
         

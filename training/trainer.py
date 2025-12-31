@@ -70,7 +70,7 @@ class EHRDiffusionTrainer:
         
         self.use_amp = config.get('use_amp', False)
         if self.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.cuda.amp.GradScaler(growth_interval=1000)
         
         if self.use_wandb and self.rank == 0:
             wandb.init(
@@ -108,7 +108,7 @@ class EHRDiffusionTrainer:
             event_mask = (input_ids > 0).float()
         
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            joint_latent, event_refined, time_refined, prompt_weights, true_length = model.encode(
+            joint_latent, event_refined, time_refined, prompt_weights, true_length, event_level_mask = model.encode(
                 input_ids, type_ids, dpe_ids, con_time,
                 event_mask=event_mask
             )
@@ -124,12 +124,10 @@ class EHRDiffusionTrainer:
                 noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
                 actual_noise = noise
             
-            event_level_mask = (event_mask.sum(dim=-1) > 0).float()
+            # event_level_mask is now returned from encode() (optimization to avoid redundant computation)
             
-            if model.use_prompts:
-                prompts_for_dit = model.pattern_prompts.prompts.unsqueeze(0).expand(B, -1, -1)
-            else:
-                prompts_for_dit = None
+            # DiT will handle prompts expansion internally (optimization)
+            prompts_for_dit = model.pattern_prompts.prompts if model.use_prompts else None
             
             # Use demographics conditionally based on config
             condition = demographics if self.use_demographics else None
@@ -233,11 +231,14 @@ class EHRDiffusionTrainer:
         predicted_length_int = torch.round(predicted_length).long()
         predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
         
-        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / event_level_mask.sum()
-        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        # Add epsilon to avoid division by zero
+        mask_sum = event_level_mask.sum() + 1e-8
+        
+        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / mask_sum
+        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / mask_sum
         
         # Bin accuracy
-        true_bins = torch.zeros_like(true_length)
+        true_bins = torch.zeros_like(true_length, dtype=torch.long)
         bin_edges = model.boundary_predictor.bin_edges
         for i in range(model.boundary_predictor.num_bins):
             if i == model.boundary_predictor.num_bins - 1:
@@ -247,10 +248,10 @@ class EHRDiffusionTrainer:
             true_bins[bin_mask] = i
         
         predicted_bins = torch.argmax(bin_logits, dim=-1)
-        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / event_level_mask.sum()
+        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / mask_sum
         
-        avg_predicted_length = (predicted_length_int.float() * event_level_mask).sum() / event_level_mask.sum()
-        avg_true_length = (true_length.float() * event_level_mask).sum() / event_level_mask.sum()
+        avg_predicted_length = (predicted_length_int.float() * event_level_mask).sum() / mask_sum
+        avg_true_length = (true_length.float() * event_level_mask).sum() / mask_sum
         
         loss_dict = {
             'total_loss': total_loss.item(),
@@ -290,7 +291,7 @@ class EHRDiffusionTrainer:
         else:
             event_mask = (input_ids > 0).float()
         
-        joint_latent, event_refined, time_refined, prompt_weights, true_length = model.encode(
+        joint_latent, event_refined, time_refined, prompt_weights, true_length, event_level_mask = model.encode(
             input_ids, type_ids, dpe_ids, con_time,
             event_mask=event_mask
         )
@@ -305,12 +306,10 @@ class EHRDiffusionTrainer:
             noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
             actual_noise = noise
         
-        event_level_mask = (event_mask.sum(dim=-1) > 0).float()
+        # event_level_mask is now returned from encode() (optimization to avoid redundant computation)
         
-        if model.use_prompts:
-            prompts_for_dit = model.pattern_prompts.prompts.unsqueeze(0).expand(B, -1, -1)
-        else:
-            prompts_for_dit = None
+        # DiT will handle prompts expansion internally (optimization)
+        prompts_for_dit = model.pattern_prompts.prompts if model.use_prompts else None
         
         # Use demographics conditionally based on config
         condition = demographics if self.use_demographics else None
@@ -347,10 +346,13 @@ class EHRDiffusionTrainer:
         predicted_length_int = torch.round(predicted_length).long()
         predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
         
-        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / event_level_mask.sum()
-        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / event_level_mask.sum()
+        # Add epsilon to avoid division by zero
+        mask_sum = event_level_mask.sum() + 1e-8
         
-        true_bins = torch.zeros_like(true_length)
+        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / mask_sum
+        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / mask_sum
+        
+        true_bins = torch.zeros_like(true_length, dtype=torch.long)
         bin_edges = model.boundary_predictor.bin_edges
         for i in range(model.boundary_predictor.num_bins):
             if i == model.boundary_predictor.num_bins - 1:
@@ -360,7 +362,7 @@ class EHRDiffusionTrainer:
             true_bins[bin_mask] = i
         
         predicted_bins = torch.argmax(bin_logits, dim=-1)
-        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / event_level_mask.sum()
+        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / mask_sum
         
         loss_dict = {
             'total_loss': total_loss.item(),

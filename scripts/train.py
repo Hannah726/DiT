@@ -106,7 +106,7 @@ def parse_args():
     # System arguments
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
-    parser.add_argument('--use_amp', action='store_true',
+    parser.add_argument('--use_amp', action='store_true', default=True,
                        help='Use automatic mixed precision')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use')
@@ -263,7 +263,9 @@ def main():
         sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=EHRCollator(),
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=4 if args.num_workers > 0 else 2
     )
     
     val_loader = DataLoader(
@@ -273,7 +275,9 @@ def main():
         sampler=val_sampler,
         num_workers=args.num_workers,
         collate_fn=EHRCollator(),
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=4 if args.num_workers > 0 else 2
     )
     
     logger.info(f"Train dataset size: {len(train_dataset)}")

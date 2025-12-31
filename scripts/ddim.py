@@ -120,12 +120,9 @@ class DDIMSampler:
         mask = torch.ones(batch_size, num_events, device=self.device, dtype=torch.bool)
         
         # Generate prompts (consistent with training)
-        # Use learnable prompts directly, same as in training
-        prompts = None
+        # DiT will handle prompts expansion internally (optimization)
+        prompts = model.pattern_prompts.prompts if model.use_prompts else None
         condition = None
-        if model.use_prompts:
-            # Directly use learnable prompts (same as training)
-            prompts = model.pattern_prompts.prompts.unsqueeze(0).expand(batch_size, -1, -1)
         
         if demographics is not None:
             demographics_tensor = torch.from_numpy(demographics).float().to(self.device)

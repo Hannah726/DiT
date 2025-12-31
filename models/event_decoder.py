@@ -130,13 +130,17 @@ class EventDecoder(nn.Module):
         event_h = self.latent_proj(event_latents)  # (B, N, hidden_dim)
         
         # Length-aware decoding: incorporate target length information
+        # Priority: target_length > boundary_mask (inferred) > None
         if target_length is not None:
-            # Embed target length
+            # Use target_length directly (preferred)
             length_emb = self.length_embedding(target_length)  # (B, N, hidden_dim)
-            # Combine event and length information
             x = self.length_aware_proj(torch.cat([event_h, length_emb], dim=-1))  # (B, N, hidden_dim)
+            # Generate boundary_mask from target_length if not provided
+            if boundary_mask is None:
+                positions = torch.arange(L, device=target_length.device).unsqueeze(0).unsqueeze(0)
+                boundary_mask = (positions < target_length.unsqueeze(-1)).float()  # (B, N, L)
         elif boundary_mask is not None:
-            # Infer length from boundary_mask
+            # Infer length from boundary_mask (fallback when target_length is None)
             inferred_length = boundary_mask.sum(dim=-1).long()  # (B, N)
             inferred_length = torch.clamp(inferred_length, 0, self.max_token_len)
             length_emb = self.length_embedding(inferred_length)  # (B, N, hidden_dim)
