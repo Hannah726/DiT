@@ -1,6 +1,6 @@
 """
 Complete EHR Diffusion Model with Pattern Discovery
-Integrates: HybridTimeEncoder + PatternDiscoveryPrompts + BoundaryPredictor
+Integrates: HybridTimeEncoder + PatternDiscoveryPrompts + Validity-based Decoding
 """
 
 import torch
@@ -11,7 +11,6 @@ from models.event_encoder import StructuredEventEncoder
 from models.time_encoder import HybridTimeEncoder
 from models.demographic_encoder import DemographicEncoder
 from models.pattern_prompts import PatternDiscoveryPrompts
-from models.boundary_predictor import SimpleBoundaryPredictor
 from models.dit import DiT
 from models.event_decoder import EventDecoder
 from models.time_decoder import TimeDecoder
@@ -25,10 +24,9 @@ class EHRDiffusionModel(nn.Module):
         1. StructuredEventEncoder: (token, type, dpe) -> event_latent (64)
         2. HybridTimeEncoder: log_time -> time_emb (32)
         3. PatternDiscoveryPrompts: (event, time) -> (event_refined, time_refined, prompts)
-        4. SimpleBoundaryPredictor: event_refined -> length_dist (boundary NOT in diffusion)
-        5. Joint Latent: [event_refined, time_refined] (192) - NO boundary
-        6. DiT: Denoising with prompt conditioning (only event + time)
-        7. Decoders: Reconstruct events, time, and boundary (from denoised event)
+        4. Joint Latent: [event_refined, time_refined] (192)
+        5. DiT: Denoising with prompt conditioning
+        6. Decoders: Reconstruct events and time (validity-based boundary)
     
     Args:
         vocab_size: Token vocabulary size
@@ -73,7 +71,7 @@ class EHRDiffusionModel(nn.Module):
         self.use_prompts = use_prompts
         
         # Joint latent only contains event_refined + time_refined (no boundary)
-        self.latent_dim = pattern_dim + pattern_dim  # 96 + 96 = 192
+        self.latent_dim = pattern_dim + pattern_dim
         
         self.event_encoder = StructuredEventEncoder(
             vocab_sizes={
@@ -109,17 +107,8 @@ class EHRDiffusionModel(nn.Module):
             dropout=dropout
         )
         
-        # Boundary predictor now takes event_refined as input (not boundary_emb)
-        # Note: BinnedBoundaryPredictor doesn't need max_len (bins are fixed: [11, 128])
-        self.boundary_predictor = SimpleBoundaryPredictor(
-            input_dim=pattern_dim,  # Takes event_refined (pattern_dim) as input
-            hidden_dim=128,
-            dropout=dropout
-        )
-        
-        # DiT now only processes event_refined + time_refined (no boundary)
         self.dit = DiT(
-            latent_dim=self.latent_dim,  # 192 (event + time only)
+            latent_dim=self.latent_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
@@ -159,11 +148,10 @@ class EHRDiffusionModel(nn.Module):
             event_mask: (B, N, L) - valid token mask
         
         Returns:
-            joint_latent: (B, N, 192) - [event_refined, time_refined] (NO boundary)
+            joint_latent: (B, N, 192) - [event_refined, time_refined]
             event_refined: (B, N, 96)
             time_refined: (B, N, 96)
             prompt_weights: (B, N, K)
-            true_length: (B, N) - ground truth lengths
             event_level_mask: (B, N) - valid event mask (1 for valid, 0 for padding)
         """
         event_latent = self.event_encoder(
@@ -177,33 +165,27 @@ class EHRDiffusionModel(nn.Module):
         if event_mask is not None:
             event_mask_sum = event_mask.sum(dim=-1)  # (B, N) - compute once
             event_level_mask = (event_mask_sum > 0).float()  # (B, N)
-            true_length = event_mask_sum.long()  # (B, N)
         else:
             event_level_mask = None
-            true_length = (input_ids > 0).sum(dim=-1).long()
-        
+
         event_refined, time_refined, prompt_weights = self.pattern_prompts(
             event_latent, time_emb,
             mask=event_level_mask
         )
-        
-        # Joint latent only contains event_refined + time_refined
-        # Boundary is NOT included in diffusion process
+
         joint_latent = torch.cat([
             event_refined,
             time_refined
         ], dim=-1)
         
-        return joint_latent, event_refined, time_refined, prompt_weights, true_length, event_level_mask
+        return joint_latent, event_refined, time_refined, prompt_weights, event_level_mask
     
-    def decode(self, event_latent, boundary_mask=None, target_length=None, return_logits=False):
+    def decode(self, event_latent, return_logits=False):
         """
         Decode event latent back to tokens
         
         Args:
             event_latent: (B, N, 96) - refined event latents
-            boundary_mask: (B, N, L) - boundary constraint mask (optional)
-            target_length: (B, N) - target length for length-aware decoding (optional)
             return_logits: Whether to return logits
         
         Returns:
@@ -211,8 +193,6 @@ class EHRDiffusionModel(nn.Module):
         """
         return self.event_decoder(
             event_latent,
-            boundary_mask=boundary_mask,
-            target_length=target_length,
             return_logits=return_logits
         )
     
@@ -228,70 +208,29 @@ class EHRDiffusionModel(nn.Module):
         """
         return self.time_decoder(time_emb)
     
-    def predict_boundary(self, event_refined):
+    def decode_joint_latent(self, joint_latent, return_logits=False):
         """
-        Predict boundary (length) distribution from event_refined
-        
-        Args:
-            event_refined: (B, N, pattern_dim) - refined event latents
-        
-        Returns:
-            length_logits: (B, N, num_bins) - bin classification logits
-            length_dist: (B, N, num_bins) - bin probabilities
-        """
-        bin_logits, bin_probs, _ = self.boundary_predictor(event_refined)
-        return bin_logits, bin_probs
-    
-    def decode_joint_latent(self, joint_latent, return_logits=False, 
-                           deterministic_boundary=True, soft_boundary=False, 
-                           boundary_temperature=1.0, top_k=3):
-        """
-        Decode joint latent to events, time, and boundary
+        Decode joint latent to events and time
         
         Args:
             joint_latent: (B, N, 192) - denoised joint latent (event + time only)
             return_logits: Whether to return logits for events
-            deterministic_boundary: Use argmax for boundary (vs sampling)
-            soft_boundary: If True, use top-k sampling for robust boundary prediction
-            boundary_temperature: Temperature for boundary sampling (lower = more deterministic)
-            top_k: Number of top candidates in soft boundary mode
         
         Returns:
-            decoded_events: dict with 'token', 'type', 'dpe'
+            decoded_events: dict with 'token', 'type', 'dpe', 'validity' (if return_logits=True)
             decoded_time: (B, N, 1)
-            predicted_length: (B, N)
-            boundary_mask: (B, N, L)
         """
-        # Split joint latent
         event_latent = joint_latent[..., :self.pattern_dim]
         time_latent = joint_latent[..., self.pattern_dim:2*self.pattern_dim]
         
-        # Predict boundary from denoised event_latent
-        # BinnedBoundaryPredictor returns: (bin_logits, bin_probs, predicted_length)
-        bin_logits, bin_probs, predicted_length = self.boundary_predictor(event_latent)
-        
-        # Round to nearest integer
-        predicted_length = torch.round(predicted_length).long()
-        predicted_length = torch.clamp(predicted_length, 11, 128)
-        
-        # Use length-aware decoding with predicted_length
-        # EventDecoder will generate boundary_mask internally from target_length
         decoded_events = self.event_decoder(
             event_latent,
-            boundary_mask=None,  # Will be generated from target_length in EventDecoder
-            target_length=predicted_length,
             return_logits=return_logits
         )
         
-        # Generate boundary_mask for return value (for consistency)
-        B, N = predicted_length.shape
-        L = self.event_decoder.max_token_len
-        positions = torch.arange(L, device=predicted_length.device).unsqueeze(0).unsqueeze(0)
-        boundary_mask = (positions < predicted_length.unsqueeze(-1)).float()
-        
         decoded_time = self.time_decoder(time_latent)
         
-        return decoded_events, decoded_time, predicted_length, boundary_mask
+        return decoded_events, decoded_time
     
     def forward(self, input_ids, type_ids, dpe_ids, con_time, demographics=None, mask=None):
         """
@@ -299,23 +238,19 @@ class EHRDiffusionModel(nn.Module):
         """
         token_mask = (input_ids > 0).float()
         
-        joint_latent, event_refined, time_refined, prompt_weights, true_length, _ = self.encode(
+        joint_latent, event_refined, time_refined, prompt_weights, _ = self.encode(
             input_ids, type_ids, dpe_ids, con_time,
             event_mask=token_mask
         )
         
-        decoded_events, decoded_time, predicted_length, boundary_mask = self.decode_joint_latent(
+        decoded_events, decoded_time = self.decode_joint_latent(
             joint_latent,
-            return_logits=False,
-            deterministic_boundary=True,
-            soft_boundary=False  # Use deterministic for forward pass
+            return_logits=False
         )
         
         return {
             'token': decoded_events['token'],
             'type': decoded_events['type'],
             'dpe': decoded_events['dpe'],
-            'time': decoded_time,
-            'predicted_length': predicted_length,
-            'true_length': true_length
+            'time': decoded_time
         }

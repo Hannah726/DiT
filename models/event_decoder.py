@@ -1,6 +1,6 @@
 """
 Event Decoder: Latent -> Structured Tokens
-Reconstructs (token, type, dpe) from event latents with boundary constraints
+Reconstructs (token, type, dpe) from event latents with validity-based length control
 """
 
 import torch
@@ -13,15 +13,10 @@ class EventDecoder(nn.Module):
     """
     Decodes event latent vectors back to structured token sequences
     
-    Key Updates:
-        - Supports boundary-constrained generation
-        - Can apply predicted length masks during decoding
-        - Maintains original multi-channel prediction
-    
     Architecture:
         1. Expand latent to hidden dimension
         2. Generate token-level features
-        3. Predict token/type/dpe distributions
+        3. Predict token/type/dpe distributions + validity scores
     
     Args:
         event_dim: Input event latent dimension
@@ -33,7 +28,7 @@ class EventDecoder(nn.Module):
     
     def __init__(
         self,
-        event_dim: int = 96,  # Changed from 64 to match refined event dim
+        event_dim: int = 96,
         hidden_dim: int = 256,
         vocab_sizes: dict = None,
         max_token_len: int = 128,
@@ -48,34 +43,23 @@ class EventDecoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.vocab_sizes = vocab_sizes
         self.max_token_len = max_token_len
-        
-        # Length embedding for length-aware decoding
-        self.length_embedding = nn.Embedding(max_token_len + 1, hidden_dim)
-        
-        # Expand event latent (now with length information)
+
+        # Project event latent to hidden dimension
         self.latent_proj = nn.Sequential(
             nn.Linear(event_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
         )
-        
-        # Length-aware projection: combine event latent with length embedding
-        self.length_aware_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # event + length
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Generate token-level representations
+
+        # Expand latent to token-level dimension
         self.token_expander = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim * 2, hidden_dim * max_token_len)
         )
-        
+
         # Transformer for token-level refinement
         self.token_transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -92,10 +76,18 @@ class EventDecoder(nn.Module):
         self.token_head = nn.Linear(hidden_dim, vocab_sizes['token'])
         self.type_head = nn.Linear(hidden_dim, vocab_sizes['type'])
         self.dpe_head = nn.Linear(hidden_dim, vocab_sizes['dpe'])
-        
-        # Initialize weights
+
+        # Validity score head
+        self.validity_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()            
+        )
+
+        # Initialize weights                    
         self.apply(self._init_weights)
-    
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.xavier_uniform_(module.weight)
@@ -105,68 +97,45 @@ class EventDecoder(nn.Module):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, event_latents, boundary_mask=None, target_length=None, return_logits=False):
+    def forward(self, event_latents, return_logits=False):
         """
         Args:
             event_latents: (B, N, event_dim) - event latent vectors
-            boundary_mask: (B, N, L) - optional boundary constraint mask
-                          1 for valid positions, 0 for padding
-                          Used for masking output tokens (not for length inference)
-            target_length: (B, N) - optional target length for length-aware decoding
-                          If provided, enables length-aware decoding and generates boundary_mask
             return_logits: Whether to return raw logits or sampled IDs
         
         Returns:
             If return_logits=True:
-                dict with keys 'token', 'type', 'dpe'
-                - Each: (B, N, L, vocab_size) - logits
+                dict with keys 'token', 'type', 'dpe', 'validity'
+                - token/type/dpe: (B, N, L, vocab_size) - logits
+                - validity: (B, N, L) - validity scores
             Else:
                 dict with keys 'token', 'type', 'dpe'
                 - Each: (B, N, L) - sampled IDs with padding=0
+                - Tokens are masked by validity scores (validity > 0.5)
         """
         B, N, _ = event_latents.shape
         L = self.max_token_len
         
         # Project event latents
-        event_h = self.latent_proj(event_latents)  # (B, N, hidden_dim)
-        
-        # Length-aware decoding: incorporate target length information
-        if target_length is not None:
-            # Use target_length directly (preferred)
-            length_emb = self.length_embedding(target_length)  # (B, N, hidden_dim)
-            x = self.length_aware_proj(torch.cat([event_h, length_emb], dim=-1))  # (B, N, hidden_dim)
-            # Generate boundary_mask from target_length if not provided
-            if boundary_mask is None:
-                positions = torch.arange(L, device=target_length.device).unsqueeze(0).unsqueeze(0)
-                boundary_mask = (positions < target_length.unsqueeze(-1)).float()  # (B, N, L)
-        else:
-            # No length information, use event latent only
-            # Note: boundary_mask can still be used for masking output tokens
-            x = event_h
-        
-        # Expand to token level
-        x_expanded = self.token_expander(x)  # (B, N, hidden_dim * L)
-        x_expanded = rearrange(x_expanded, 'b n (l d) -> b n l d', l=L)
-        
-        # Flatten for transformer
-        x_flat = rearrange(x_expanded, 'b n l d -> (b n) l d')
-        
-        # Refine with transformer
-        x_refined = self.token_transformer(x_flat)
-        
-        # Reshape back
-        x_refined = rearrange(x_refined, '(b n) l d -> b n l d', b=B, n=N)
-        
-        # Predict token/type/dpe
-        token_logits = self.token_head(x_refined)  # (B, N, L, vocab_token)
+        event_h = self.latent_proj(event_latents)   # (B, N, hidden_dim)
+        x_expanded = self.token_expander(event_h)   # (B, N, hidden_dim * L)
+        x_expanded = rearrange(x_expanded, 'b n (l d) -> b n l d', l=L)   # (B, N, L, hidden_dim)
+        x_flat = rearrange(x_expanded, 'b n l d -> (b n) l d')   # (B*N, L, hidden_dim)
+        x_refined = self.token_transformer(x_flat)   # (B*N, L, hidden_dim)
+        x_refined = rearrange(x_refined, '(b n) l d -> b n l d', b=B, n=N)   # (B, N, L, hidden_dim)
+
+        token_logits = self.token_head(x_refined)
         type_logits = self.type_head(x_refined)
         dpe_logits = self.dpe_head(x_refined)
+        # Predict validity scores
+        validity_scores = self.validity_head(x_refined).squeeze(-1)
         
         if return_logits:
             return {
                 'token': token_logits,
                 'type': type_logits,
-                'dpe': dpe_logits
+                'dpe': dpe_logits,
+                'validity': validity_scores
             }
         else:
             # Sample IDs (greedy decoding)
@@ -174,12 +143,11 @@ class EventDecoder(nn.Module):
             type_ids = type_logits.argmax(dim=-1)
             dpe_ids = dpe_logits.argmax(dim=-1)
             
-            # Apply boundary mask if provided
-            if boundary_mask is not None:
-                mask_long = boundary_mask.long()
-                token_ids = token_ids * mask_long
-                type_ids = type_ids * mask_long
-                dpe_ids = dpe_ids * mask_long
+            # Mask invalid tokens using validity scores
+            validity_mask = (validity_scores > 0.5).float()
+            token_ids = token_ids * validity_mask.long()
+            type_ids = type_ids * validity_mask.long()
+            dpe_ids = dpe_ids * validity_mask.long()
             
             return {
                 'token': token_ids,
@@ -187,60 +155,51 @@ class EventDecoder(nn.Module):
                 'dpe': dpe_ids
             }
     
-    def compute_reconstruction_loss(self, event_latents, target_tokens, 
-                                   target_types, target_dpes, mask=None, target_length=None):
+    def compute_validity_loss(self, event_latents, target_tokens, mask=None):
         """
-        Compute cross-entropy loss for reconstruction
+        Compute validity loss only (no reconstruction loss for token/type/dpe)
         
         Args:
             event_latents: (B, N, event_dim)
-            target_tokens: (B, N, L) - ground truth token IDs
-            target_types: (B, N, L) - ground truth type IDs
-            target_dpes: (B, N, L) - ground truth DPE IDs
+            target_tokens: (B, N, L) - ground truth token IDs (used to compute true validity)
             mask: (B, N, L) - valid token mask (1 for valid, 0 for padding)
-            target_length: (B, N) - target length for length-aware decoding (optional)
         
         Returns:
-            loss: Scalar reconstruction loss
+            loss: Scalar validity loss
             loss_dict: Dictionary of loss components
         """
-        # Get logits with length-aware decoding
-        logits = self.forward(event_latents, boundary_mask=mask, target_length=target_length, return_logits=True)
-        
+        logits = self.forward(event_latents, return_logits=True)
+
         B, N, L = target_tokens.shape
         
-        # Create mask from target_tokens if not provided
         if mask is None:
             mask = (target_tokens > 0).float()
         
-        # Reshape for cross entropy
-        token_logits = rearrange(logits['token'], 'b n l v -> (b n l) v')
-        type_logits = rearrange(logits['type'], 'b n l v -> (b n l) v')
-        dpe_logits = rearrange(logits['dpe'], 'b n l v -> (b n l) v')
+        # True validity: 1 for valid tokens, 0 for padding
+        true_validity = (target_tokens > 0).float()
         
-        target_tokens_flat = rearrange(target_tokens, 'b n l -> (b n l)')
-        target_types_flat = rearrange(target_types, 'b n l -> (b n l)')
-        target_dpes_flat = rearrange(target_dpes, 'b n l -> (b n l)')
-        mask_flat = rearrange(mask, 'b n l -> (b n l)')
+        # Apply mask if provided
+        if mask is not None:
+            true_validity = true_validity * mask
         
-        # Compute losses
-        token_loss = F.cross_entropy(token_logits, target_tokens_flat, reduction='none')
-        type_loss = F.cross_entropy(type_logits, target_types_flat, reduction='none')
-        dpe_loss = F.cross_entropy(dpe_logits, target_dpes_flat, reduction='none')
-        
-        # Apply mask
-        token_loss = (token_loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
-        type_loss = (type_loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
-        dpe_loss = (dpe_loss * mask_flat).sum() / (mask_flat.sum() + 1e-8)
-        
-        # Total loss
-        total_loss = token_loss + type_loss + dpe_loss
+        # Compute focal loss for validity
+        validity_bce = F.binary_cross_entropy(
+            logits['validity'],
+            true_validity,
+            reduction='none'
+        )
+
+        # Focal weight: focus on hard examples
+        pt = torch.where(
+            true_validity == 1,
+            logits['validity'],
+            torch.ones_like(logits['validity']) - logits['validity']
+        )
+
+        focal_weight = (1 - pt) ** 2
+        validity_loss = (focal_weight * validity_bce).mean()
         
         loss_dict = {
-            'total': total_loss.item(),
-            'token': token_loss.item(),
-            'type': type_loss.item(),
-            'dpe': dpe_loss.item()
+            'validity': validity_loss.item()
         }
-        
-        return total_loss, loss_dict
+        return validity_loss, loss_dict

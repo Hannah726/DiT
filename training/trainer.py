@@ -1,5 +1,5 @@
 """
-Trainer for EHR Diffusion Model with Gradient Accumulation
+Trainer for EHR Diffusion Model with Validity-based Reconstruction
 """
 
 import os
@@ -15,17 +15,11 @@ from models.gaussian_diffusion import TimeAwareGaussianDiffusion
 
 class EHRDiffusionTrainer:
     """
-    Trainer for EHR Diffusion Model with Gradient Accumulation Support
+    Trainer for EHR Diffusion Model
     
     Loss Components:
         1. Diffusion Loss: MSE(predicted_noise, true_noise)
-        2. Boundary Loss: CE(predicted_length, true_length)
-        3. Reconstruction Loss (optional): Event/Time reconstruction
-    
-    Features:
-        - Gradient Accumulation: Train with large effective batch sizes
-        - Mixed Precision: AMP for faster training
-        - Automatic memory management
+        2. Validity Loss: Focal loss for token validity prediction (weighted by recon_weight)
     """
     
     def __init__(
@@ -60,24 +54,12 @@ class EHRDiffusionTrainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         
-        self.boundary_weight = config.get('boundary_weight', 0.5)
         self.recon_weight = config.get('recon_weight', 0.1)
-        
-        # Demographics conditioning
         self.use_demographics = config.get('use_demographics', False)
-        
-        # ============ GRADIENT ACCUMULATION ============
         self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
+        
         if self.gradient_accumulation_steps > 1:
             self.logger.info(f"Using Gradient Accumulation with {self.gradient_accumulation_steps} steps")
-            self.logger.info(f"Effective batch size: {config.get('batch_size', 32) * self.gradient_accumulation_steps}")
-        # ================================================
-        
-        # Scheduled sampling for boundary prediction
-        self.scheduled_sampling = config.get('scheduled_sampling', False)
-        self.scheduled_sampling_start = config.get('scheduled_sampling_start', 0.0)
-        self.scheduled_sampling_end = config.get('scheduled_sampling_end', 0.5)
-        self.scheduled_sampling_prob = 1.0
         
         self.use_amp = config.get('use_amp', False)
         if self.use_amp:
@@ -92,11 +74,11 @@ class EHRDiffusionTrainer:
     
     def train_step(self, batch, accumulation_step):
         """
-        Single training step with gradient accumulation support
+        Single training step with gradient accumulation
         
         Args:
             batch: Input batch
-            accumulation_step: Current step in accumulation cycle (0-indexed)
+            accumulation_step: Current step in accumulation cycle
         
         Returns:
             loss_dict: Dictionary of loss components
@@ -123,7 +105,7 @@ class EHRDiffusionTrainer:
             event_mask = (input_ids > 0).float()
         
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            joint_latent, event_refined, time_refined, prompt_weights, true_length, event_level_mask = model.encode(
+            joint_latent, event_refined, time_refined, prompt_weights, event_level_mask = model.encode(
                 input_ids, type_ids, dpe_ids, con_time,
                 event_mask=event_mask
             )
@@ -153,74 +135,28 @@ class EHRDiffusionTrainer:
                 reduction='sum'
             ) / event_level_mask.sum()
             
+            # Compute validity loss for event decoder
             predicted_x0 = self.diffusion.predict_start_from_noise(
                 noisy_latent, t, predicted_noise
             )
+            
             denoised_event_latent = predicted_x0[..., :model.pattern_dim]
-            
-            bin_logits, bin_probs, predicted_length = model.boundary_predictor(denoised_event_latent)
-            
-            boundary_loss = model.boundary_predictor.compute_loss(
-                bin_logits,
-                predicted_length,
-                true_length.float(),
-                mask=event_level_mask
+            validity_loss, validity_loss_dict = model.event_decoder.compute_validity_loss(
+                denoised_event_latent,
+                input_ids,
+                mask=event_mask
             )
             
-            if self.scheduled_sampling:
-                predicted_length_rounded = torch.round(predicted_length).long()
-                predicted_length_rounded = torch.clamp(predicted_length_rounded, 11, 128)
-                use_predicted = torch.rand(B, device=self.device) < self.scheduled_sampling_prob
-                boundary_length_for_mask = torch.where(
-                    use_predicted.unsqueeze(-1),
-                    predicted_length_rounded,
-                    true_length
-                )
-            else:
-                boundary_length_for_mask = true_length
-            
-            recon_loss = 0.0
-            if self.recon_weight > 0:
-                B, N = boundary_length_for_mask.shape
-                L = model.event_decoder.max_token_len
-                positions = torch.arange(L, device=self.device).unsqueeze(0).unsqueeze(0)
-                boundary_mask_train = (positions < boundary_length_for_mask.unsqueeze(-1)).float()
-                combined_mask = event_mask * boundary_mask_train
-                
-                denoised_event_latent_for_recon = predicted_x0[..., :model.pattern_dim]
-                denoised_time_latent_for_recon = predicted_x0[..., model.pattern_dim:2*model.pattern_dim]
-                
-                event_recon_loss, _ = model.event_decoder.compute_reconstruction_loss(
-                    denoised_event_latent_for_recon,
-                    input_ids,
-                    type_ids,
-                    dpe_ids,
-                    mask=combined_mask,
-                    target_length=boundary_length_for_mask
-                )
-                
-                time_recon_loss, _ = model.time_decoder.compute_reconstruction_loss(
-                    denoised_time_latent_for_recon,
-                    con_time,
-                    mask=event_level_mask
-                )
-                
-                recon_loss = event_recon_loss + time_recon_loss
-            
-            total_loss = diff_loss + self.boundary_weight * boundary_loss + self.recon_weight * recon_loss
-            
-            # ============ GRADIENT ACCUMULATION ============
-            # Scale loss by accumulation steps
+            # Loss: diffusion loss + validity loss (weighted)
+            # Note: recon_weight actually weights validity_loss, not a true reconstruction loss
+            total_loss = diff_loss + self.recon_weight * validity_loss
             total_loss = total_loss / self.gradient_accumulation_steps
-            # ================================================
         
-        # ============ GRADIENT ACCUMULATION BACKWARD ============
         if self.use_amp:
             self.scaler.scale(total_loss).backward()
         else:
             total_loss.backward()
         
-        # Only step optimizer every N accumulation steps
         is_accumulation_step = (accumulation_step + 1) % self.gradient_accumulation_steps == 0
         
         if is_accumulation_step:
@@ -237,52 +173,19 @@ class EHRDiffusionTrainer:
             
             if self.scheduler is not None:
                 self.scheduler.step()
-        # =========================================================
         
-        # Metrics: round predicted_length for comparison
-        predicted_length_int = torch.round(predicted_length).long()
-        predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
-        
-        mask_sum = event_level_mask.sum() + 1e-8
-        
-        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / mask_sum
-        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / mask_sum
-        
-        # Bin accuracy
-        true_bins = torch.zeros_like(true_length, dtype=torch.long)
-        bin_edges = model.boundary_predictor.bin_edges
-        for i in range(model.boundary_predictor.num_bins):
-            if i == model.boundary_predictor.num_bins - 1:
-                bin_mask = (true_length >= bin_edges[i]) & (true_length <= bin_edges[i+1])
-            else:
-                bin_mask = (true_length >= bin_edges[i]) & (true_length < bin_edges[i+1])
-            true_bins[bin_mask] = i
-        
-        predicted_bins = torch.argmax(bin_logits, dim=-1)
-        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / mask_sum
-        
-        avg_predicted_length = (predicted_length_int.float() * event_level_mask).sum() / mask_sum
-        avg_true_length = (true_length.float() * event_level_mask).sum() / mask_sum
-        
-        # ============ SCALE BACK LOSS FOR LOGGING ============
         loss_dict = {
             'total_loss': (total_loss * self.gradient_accumulation_steps).item(),
             'diff_loss': diff_loss.item(),
-            'boundary_loss': boundary_loss.item(),
-            'recon_loss': recon_loss.item() if isinstance(recon_loss, torch.Tensor) else recon_loss,
-            'boundary_accuracy': boundary_accuracy.item(),
-            'boundary_mae': boundary_mae.item(),
-            'bin_accuracy': bin_accuracy.item(),
-            'avg_predicted_length': avg_predicted_length.item(),
-            'avg_true_length': avg_true_length.item()
+            'validity_loss': validity_loss.item()
         }
-        # =====================================================
+        loss_dict.update({f'validity_{k}': v for k, v in validity_loss_dict.items()})
         
         return loss_dict
     
     @torch.no_grad()
     def val_step(self, batch):
-        """Validation step (unchanged)"""
+        """Validation step"""
         self.model.eval()
         
         input_ids = batch['input_ids'].to(self.device)
@@ -304,7 +207,7 @@ class EHRDiffusionTrainer:
         else:
             event_mask = (input_ids > 0).float()
         
-        joint_latent, event_refined, time_refined, prompt_weights, true_length, event_level_mask = model.encode(
+        joint_latent, event_refined, time_refined, prompt_weights, event_level_mask = model.encode(
             input_ids, type_ids, dpe_ids, con_time,
             event_mask=event_mask
         )
@@ -334,77 +237,39 @@ class EHRDiffusionTrainer:
             reduction='sum'
         ) / event_level_mask.sum()
         
+        # Compute validity loss for event decoder (same as training)
         predicted_x0 = self.diffusion.predict_start_from_noise(
             noisy_latent, t, predicted_noise
         )
-        predicted_event_latent = predicted_x0[..., :model.pattern_dim]
         
-        bin_logits, bin_probs, predicted_length = model.boundary_predictor(predicted_event_latent)
-        
-        boundary_loss = model.boundary_predictor.compute_loss(
-            bin_logits,
-            predicted_length,
-            true_length.float(),
-            mask=event_level_mask
+        denoised_event_latent = predicted_x0[..., :model.pattern_dim]
+        validity_loss, validity_loss_dict = model.event_decoder.compute_validity_loss(
+            denoised_event_latent,
+            input_ids,
+            mask=event_mask
         )
         
-        total_loss = diff_loss + self.boundary_weight * boundary_loss
-        
-        predicted_length_int = torch.round(predicted_length).long()
-        predicted_length_int = torch.clamp(predicted_length_int, 11, 128)
-        
-        mask_sum = event_level_mask.sum() + 1e-8
-        
-        boundary_accuracy = ((predicted_length_int == true_length).float() * event_level_mask).sum() / mask_sum
-        boundary_mae = (torch.abs(predicted_length_int - true_length).float() * event_level_mask).sum() / mask_sum
-        
-        true_bins = torch.zeros_like(true_length, dtype=torch.long)
-        bin_edges = model.boundary_predictor.bin_edges
-        for i in range(model.boundary_predictor.num_bins):
-            if i == model.boundary_predictor.num_bins - 1:
-                bin_mask = (true_length >= bin_edges[i]) & (true_length <= bin_edges[i+1])
-            else:
-                bin_mask = (true_length >= bin_edges[i]) & (true_length < bin_edges[i+1])
-            true_bins[bin_mask] = i
-        
-        predicted_bins = torch.argmax(bin_logits, dim=-1)
-        bin_accuracy = ((predicted_bins == true_bins).float() * event_level_mask).sum() / mask_sum
+        # Total loss: diffusion loss + validity loss (weighted)
+        total_loss = diff_loss + self.recon_weight * validity_loss
         
         loss_dict = {
             'total_loss': total_loss.item(),
             'diff_loss': diff_loss.item(),
-            'boundary_loss': boundary_loss.item(),
-            'boundary_accuracy': boundary_accuracy.item(),
-            'boundary_mae': boundary_mae.item(),
-            'bin_accuracy': bin_accuracy.item()
+            'validity_loss': validity_loss.item()
         }
+        loss_dict.update({f'validity_{k}': v for k, v in validity_loss_dict.items()})
         
         return loss_dict
     
     def train_epoch(self):
-        """Train for one epoch with gradient accumulation"""
+        """Train for one epoch"""
         metric_logger = MetricLogger(delimiter="  ")
         
-        if self.scheduled_sampling:
-            total_epochs = self.config.get('epochs', 100)
-            start_epoch = int(self.scheduled_sampling_start * total_epochs)
-            end_epoch = int(self.scheduled_sampling_end * total_epochs)
-            
-            if self.current_epoch < start_epoch:
-                self.scheduled_sampling_prob = 0.0
-            elif self.current_epoch >= end_epoch:
-                self.scheduled_sampling_prob = 1.0
-            else:
-                progress = (self.current_epoch - start_epoch) / (end_epoch - start_epoch)
-                self.scheduled_sampling_prob = progress
-        
-        # ============ GRADIENT ACCUMULATION LOOP ============
         accumulation_step = 0
         for batch in tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}", disable=self.rank != 0):
             loss_dict = self.train_step(batch, accumulation_step)
             metric_logger.update(**loss_dict)
             
-            # Only increment global_step after actual optimizer step
             if (accumulation_step + 1) % self.gradient_accumulation_steps == 0:
                 self.global_step += 1
                 
@@ -412,7 +277,6 @@ class EHRDiffusionTrainer:
                     wandb.log({f'train/{k}': v for k, v in loss_dict.items()}, step=self.global_step)
             
             accumulation_step += 1
-        # ====================================================
         
         if self.rank == 0:
             self.logger.info(f"Train Epoch {self.current_epoch}: {metric_logger}")
@@ -421,7 +285,7 @@ class EHRDiffusionTrainer:
     
     @torch.no_grad()
     def validate(self):
-        """Validate on validation set (unchanged)"""
+        """Validate on validation set"""
         metric_logger = MetricLogger(delimiter="  ")
         
         for batch in tqdm(self.val_loader, desc="Validation", disable=self.rank != 0):
@@ -437,7 +301,7 @@ class EHRDiffusionTrainer:
         return metric_logger.get_dict()
     
     def save_checkpoint(self, is_best=False):
-        """Save checkpoint (unchanged)"""
+        """Save checkpoint"""
         if self.rank != 0:
             return
         
@@ -467,7 +331,7 @@ class EHRDiffusionTrainer:
             self.logger.info(f"Saved best checkpoint to {best_path}")
     
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint (unchanged)"""
+        """Load checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         model = self.model.module if hasattr(self.model, 'module') else self.model
@@ -485,7 +349,7 @@ class EHRDiffusionTrainer:
         self.logger.info(f"Resuming from epoch {self.current_epoch}, step {self.global_step}")
     
     def train(self):
-        """Main training loop (unchanged)"""
+        """Main training loop"""
         for epoch in range(self.current_epoch, self.config['epochs']):
             self.current_epoch = epoch
             
