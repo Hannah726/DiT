@@ -116,12 +116,12 @@ class EHRDiffusionDataset(Dataset):
         real_idx = self.indices[idx]
         
         # Load structured event data
-        # Use torch.as_tensor to avoid unnecessary copy when possible
-        # Note: mmap arrays need explicit copy, but we can optimize dtype conversion
-        input_ids = torch.as_tensor(self.input_ids[real_idx], dtype=torch.long)  # (max_events, 128)
-        type_ids = torch.as_tensor(self.type_ids[real_idx], dtype=torch.long)
-        dpe_ids = torch.as_tensor(self.dpe_ids[real_idx], dtype=torch.long)
-        con_time = torch.as_tensor(self.con_time[real_idx], dtype=torch.float32)  # (max_events, 1)
+        # Use torch.from_numpy().clone() to create writable tensors from mmap arrays
+        # This avoids the warning about non-writable tensors
+        input_ids = torch.from_numpy(self.input_ids[real_idx].copy()).long()  # (max_events, 128)
+        type_ids = torch.from_numpy(self.type_ids[real_idx].copy()).long()
+        dpe_ids = torch.from_numpy(self.dpe_ids[real_idx].copy()).long()
+        con_time = torch.from_numpy(self.con_time[real_idx].copy()).float()  # (max_events, 1)
         
         # Create mask for valid events (non-padding)
         # Assume padding token is 0

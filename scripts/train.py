@@ -74,6 +74,8 @@ def parse_args():
     parser.add_argument('--log_interval', type=int, default=100)
     parser.add_argument('--val_interval', type=int, default=1)
     parser.add_argument('--save_interval', type=int, default=5)
+    parser.add_argument('--compile_model', action='store_true', default=False,
+                        help='Use torch.compile to optimize model (PyTorch 2.0+)')
     
     parser.add_argument('--checkpoint_dir', type=str, default='outputs/checkpoints')
     parser.add_argument('--resume', type=str, default=None)
@@ -162,6 +164,12 @@ def main():
     logger.info(f"Starting training on rank {rank}/{world_size}")
     logger.info(f"Arguments: {args}")
     
+    # Enable cuDNN benchmark for faster training (only if input sizes don't vary)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False  # Set to False for speed
+        logger.info("Enabled cuDNN benchmark for faster training")
+    
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
@@ -190,11 +198,12 @@ def main():
         train_sampler = None
         val_sampler = None
     
-    # Optimize DataLoader for memory efficiency
-    # Reduce num_workers and prefetch_factor to avoid OOM
-    # For large datasets, fewer workers with less prefetching is safer
-    effective_num_workers = min(args.num_workers, 4) if args.num_workers > 0 else 0
-    effective_prefetch = 2 if effective_num_workers > 0 else None
+    # Optimize DataLoader for memory efficiency and speed
+    # Increase prefetch_factor for better GPU utilization when using gradient accumulation
+    # Use all available workers (up to 16 for 16 CPU cores)
+    effective_num_workers = min(args.num_workers, 16) if args.num_workers > 0 else 0
+    # Increase prefetch_factor for better data loading pipeline
+    effective_prefetch = 8 if effective_num_workers > 0 else None
     
     train_loader = DataLoader(
         train_dataset,
@@ -206,7 +215,8 @@ def main():
         pin_memory=torch.cuda.is_available(),  # Only pin if CUDA available
         persistent_workers=True if effective_num_workers > 0 else False,
         prefetch_factor=effective_prefetch,
-        drop_last=False  # Don't drop incomplete batches
+        drop_last=False,  # Don't drop incomplete batches
+        pin_memory_device='cuda' if torch.cuda.is_available() else None  # Explicit device for pinning
     )
     
     val_loader = DataLoader(
@@ -219,7 +229,8 @@ def main():
         pin_memory=torch.cuda.is_available(),
         persistent_workers=True if effective_num_workers > 0 else False,
         prefetch_factor=effective_prefetch,
-        drop_last=False
+        drop_last=False,
+        pin_memory_device='cuda' if torch.cuda.is_available() else None  # Explicit device for pinning
     )
     
     logger.info(f"Train dataset size: {len(train_dataset)}")
@@ -249,6 +260,15 @@ def main():
     )
     
     model = model.to(device)
+    
+    # Compile model for faster training (PyTorch 2.0+)
+    if args.compile_model and hasattr(torch, 'compile'):
+        try:
+            logger.info("Compiling model with torch.compile for faster training...")
+            model = torch.compile(model, mode='reduce-overhead')
+            logger.info("Model compilation successful")
+        except Exception as e:
+            logger.warning(f"Model compilation failed: {e}, continuing without compilation")
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -83,20 +83,21 @@ class EHRDiffusionTrainer:
         Returns:
             loss_dict: Dictionary of loss components
         """
-        self.model.train()
+        # Model is set to train mode at epoch start, no need to set it every step
         
-        input_ids = batch['input_ids'].to(self.device)
-        type_ids = batch['type_ids'].to(self.device)
-        dpe_ids = batch['dpe_ids'].to(self.device)
-        con_time = batch['con_time'].to(self.device)
-        demographics = batch['demographics'].to(self.device) if 'demographics' in batch else None
+        # Use non_blocking=True for faster data transfer when pin_memory=True
+        input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+        type_ids = batch['type_ids'].to(self.device, non_blocking=True)
+        dpe_ids = batch['dpe_ids'].to(self.device, non_blocking=True)
+        con_time = batch['con_time'].to(self.device, non_blocking=True)
+        demographics = batch['demographics'].to(self.device, non_blocking=True) if 'demographics' in batch else None
         
         model = self.model.module if hasattr(self.model, 'module') else self.model
         
         if 'event_mask' in batch:
-            event_mask = batch['event_mask'].to(self.device)
+            event_mask = batch['event_mask'].to(self.device, non_blocking=True)
         elif 'mask' in batch:
-            mask = batch['mask'].to(self.device)
+            mask = batch['mask'].to(self.device, non_blocking=True)
             B, N, L = input_ids.shape
             event_mask = (input_ids > 0).float()
             event_level_mask_from_batch = mask.unsqueeze(-1).expand(-1, -1, L)
@@ -147,6 +148,16 @@ class EHRDiffusionTrainer:
                 mask=event_mask
             )
             
+            # Also compute accuracy on ground truth latent for better monitoring
+            # This shows validity head learning progress independent of denoising quality
+            _, gt_validity_dict = model.event_decoder.compute_validity_loss(
+                joint_latent[..., :model.pattern_dim],
+                input_ids,
+                mask=event_mask
+            )
+            # Rename to distinguish from denoised-based accuracy
+            gt_validity_dict = {f'gt_{k}': v for k, v in gt_validity_dict.items()}
+            
             # Loss: diffusion loss + validity loss (weighted)
             # Note: recon_weight actually weights validity_loss, not a true reconstruction loss
             total_loss = diff_loss + self.recon_weight * validity_loss
@@ -169,8 +180,10 @@ class EHRDiffusionTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['grad_clip'])
                 self.optimizer.step()
             
-            self.optimizer.zero_grad()
+            # Zero gradients AFTER optimizer.step() to prepare for next accumulation cycle
+            self.optimizer.zero_grad(set_to_none=True)  # set_to_none=True is faster
             
+            # Step scheduler AFTER optimizer.step() (PyTorch requirement)
             if self.scheduler is not None:
                 self.scheduler.step()
         
@@ -180,6 +193,7 @@ class EHRDiffusionTrainer:
             'validity_loss': validity_loss.item()
         }
         loss_dict.update({f'validity_{k}': v for k, v in validity_loss_dict.items()})
+        loss_dict.update(gt_validity_dict)  # Add ground truth based accuracy
         
         return loss_dict
     
@@ -264,6 +278,12 @@ class EHRDiffusionTrainer:
     def train_epoch(self):
         """Train for one epoch"""
         metric_logger = MetricLogger(delimiter="  ")
+        
+        # Ensure model is in training mode at the start of epoch
+        self.model.train()
+        
+        # Initialize gradients before first batch (important for gradient accumulation)
+        self.optimizer.zero_grad(set_to_none=True)
         
         accumulation_step = 0
         for batch in tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}", disable=self.rank != 0):

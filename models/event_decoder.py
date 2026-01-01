@@ -77,12 +77,13 @@ class EventDecoder(nn.Module):
         self.type_head = nn.Linear(hidden_dim, vocab_sizes['type'])
         self.dpe_head = nn.Linear(hidden_dim, vocab_sizes['dpe'])
 
-        # Validity score head
+        # Validity score head (outputs logits, not probabilities)
+        # Use logits for AMP compatibility with binary_cross_entropy_with_logits
         self.validity_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()            
+            nn.Linear(hidden_dim // 2, 1)
+            # No sigmoid - will use BCEWithLogitsLoss for AMP compatibility
         )
 
         # Initialize weights                    
@@ -127,15 +128,15 @@ class EventDecoder(nn.Module):
         token_logits = self.token_head(x_refined)
         type_logits = self.type_head(x_refined)
         dpe_logits = self.dpe_head(x_refined)
-        # Predict validity scores
-        validity_scores = self.validity_head(x_refined).squeeze(-1)
+        # Predict validity logits (not probabilities)
+        validity_logits = self.validity_head(x_refined).squeeze(-1)
         
         if return_logits:
             return {
                 'token': token_logits,
                 'type': type_logits,
                 'dpe': dpe_logits,
-                'validity': validity_scores
+                'validity': validity_logits  # Return logits, not probabilities
             }
         else:
             # Sample IDs (greedy decoding)
@@ -143,8 +144,9 @@ class EventDecoder(nn.Module):
             type_ids = type_logits.argmax(dim=-1)
             dpe_ids = dpe_logits.argmax(dim=-1)
             
-            # Mask invalid tokens using validity scores
-            validity_mask = (validity_scores > 0.5).float()
+            # Convert validity logits to probabilities for masking
+            validity_probs = torch.sigmoid(validity_logits)
+            validity_mask = (validity_probs > 0.5).float()
             token_ids = token_ids * validity_mask.long()
             type_ids = type_ids * validity_mask.long()
             dpe_ids = dpe_ids * validity_mask.long()
@@ -182,24 +184,42 @@ class EventDecoder(nn.Module):
         if mask is not None:
             true_validity = true_validity * mask
         
-        # Compute focal loss for validity
-        validity_bce = F.binary_cross_entropy(
-            logits['validity'],
+        # Compute focal loss for validity using logits (AMP compatible)
+        # Use binary_cross_entropy_with_logits for AMP safety
+        validity_bce = F.binary_cross_entropy_with_logits(
+            logits['validity'],  # Input is logits, not probabilities
             true_validity,
             reduction='none'
         )
 
         # Focal weight: focus on hard examples
+        # Convert logits to probabilities for focal weight calculation
+        validity_probs = torch.sigmoid(logits['validity'])
         pt = torch.where(
             true_validity == 1,
-            logits['validity'],
-            torch.ones_like(logits['validity']) - logits['validity']
+            validity_probs,
+            torch.ones_like(validity_probs) - validity_probs
         )
 
         focal_weight = (1 - pt) ** 2
         validity_loss = (focal_weight * validity_bce).mean()
         
+        # Compute validity accuracy for monitoring
+        validity_pred = (validity_probs > 0.5).float()
+        if mask is not None:
+            # Use the same mask logic as in loss computation
+            valid_mask = mask > 0
+            correct = ((validity_pred == true_validity) * valid_mask).float()
+            valid_count = valid_mask.float().sum()
+            # Avoid division by zero
+            if valid_count > 0:
+                validity_acc = correct.sum() / valid_count
+            else:
+                validity_acc = torch.tensor(0.0, device=validity_pred.device)
+        else:
+            validity_acc = (validity_pred == true_validity).float().mean()
+        
         loss_dict = {
-            'validity': validity_loss.item()
+            'validity_acc': validity_acc.item()
         }
         return validity_loss, loss_dict
