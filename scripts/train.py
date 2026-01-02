@@ -80,6 +80,9 @@ def parse_args():
     
     parser.add_argument('--distributed', action='store_true')
     parser.add_argument('--local_rank', type=int, default=0)
+    
+    parser.add_argument('--data_fraction', type=float, default=1.0,
+                        help='Fraction of data to use (0.0-1.0). Useful for quick validation.')
 
     return parser.parse_args()
 
@@ -188,6 +191,29 @@ def main():
         seed=args.seed,
         use_reduced_vocab=args.use_reduced_vocab
     )
+    
+    # Limit data fraction for quick validation
+    if args.data_fraction < 1.0:
+        from torch.utils.data import Subset
+        import random
+        
+        original_train_size = len(train_dataset)
+        original_val_size = len(val_dataset)
+        
+        train_size = int(original_train_size * args.data_fraction)
+        val_size = int(original_val_size * args.data_fraction)
+        
+        # Use random subset for training, first N for validation
+        random.seed(args.seed)
+        train_indices = random.sample(range(original_train_size), train_size)
+        val_indices = list(range(val_size))
+        
+        train_dataset = Subset(train_dataset, train_indices)
+        val_dataset = Subset(val_dataset, val_indices)
+        
+        logger.info(f"Using {args.data_fraction*100:.1f}% of data:")
+        logger.info(f"  Train: {train_size}/{original_train_size} samples")
+        logger.info(f"  Val: {val_size}/{original_val_size} samples")
     
     if args.distributed:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
