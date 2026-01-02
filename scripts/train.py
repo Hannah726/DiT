@@ -193,6 +193,10 @@ def main():
     )
     
     # Limit data fraction for quick validation
+    # Save original datasets for accessing attributes like vocab_size
+    original_train_dataset = train_dataset
+    original_val_dataset = val_dataset
+    
     if args.data_fraction < 1.0:
         from torch.utils.data import Subset
         import random
@@ -259,11 +263,11 @@ def main():
     
     logger.info(f"Train dataset size: {len(train_dataset)}")
     logger.info(f"Val dataset size: {len(val_dataset)}")
-    logger.info(f"Vocab size: {train_dataset.vocab_size}")
+    logger.info(f"Vocab size: {original_train_dataset.vocab_size}")
     logger.info(f"DataLoader config: num_workers={effective_num_workers}, prefetch_factor={effective_prefetch}, pin_memory={torch.cuda.is_available()}")
     logger.info(f"Memory optimization: batch_size={args.batch_size}, gradient_accumulation={args.gradient_accumulation_steps}, use_amp={args.use_amp}")
     
-    vocab_sizes = train_dataset.get_vocab_sizes()
+    vocab_sizes = original_train_dataset.get_vocab_sizes()
     
     logger.info("Creating model...")
     model = EHRDiffusionModel(

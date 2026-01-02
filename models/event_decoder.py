@@ -182,23 +182,16 @@ class EventDecoder(nn.Module):
         if mask is None:
             mask = (target_tokens > 0).float()
         
-        # True validity: 1 for valid tokens, 0 for padding
         true_validity = (target_tokens > 0).float()
-        
-        # Apply mask if provided
         if mask is not None:
             true_validity = true_validity * mask
         
-        # Convert logits to probabilities for accuracy calculation
         validity_probs = torch.sigmoid(logits['validity'])
         validity_pred = (validity_probs > 0.5).float()
         
-        # ========== Improved Accuracy Calculation ==========
-        # Separate accuracy for valid tokens and padding tokens
-        valid_token_mask = (true_validity == 1).float()  # (B, N, L) - positions with valid tokens
-        padding_mask = (true_validity == 0).float()     # (B, N, L) - positions with padding
+        valid_token_mask = (true_validity == 1).float()
+        padding_mask = (true_validity == 0).float()
         
-        # Accuracy on valid tokens (most important metric)
         valid_token_correct = ((validity_pred == true_validity) * valid_token_mask).float()
         valid_token_count = valid_token_mask.sum()
         if valid_token_count > 0:
@@ -206,7 +199,6 @@ class EventDecoder(nn.Module):
         else:
             valid_token_acc = torch.tensor(0.0, device=validity_pred.device)
         
-        # Accuracy on padding tokens (should be 0, but less important)
         padding_correct = ((validity_pred == true_validity) * padding_mask).float()
         padding_count = padding_mask.sum()
         if padding_count > 0:
@@ -214,12 +206,9 @@ class EventDecoder(nn.Module):
         else:
             padding_acc = torch.tensor(0.0, device=validity_pred.device)
         
-        # Overall accuracy (for reference, but less meaningful due to class imbalance)
         overall_correct = (validity_pred == true_validity).float()
         overall_acc = overall_correct.mean()
         
-        # ========== Improved Loss Calculation ==========
-        # Compute BCE loss
         validity_bce = F.binary_cross_entropy_with_logits(
             logits['validity'],
             true_validity,
@@ -227,35 +216,22 @@ class EventDecoder(nn.Module):
             pos_weight=pos_weight
         )
         
-        # Focal weight: focus on hard examples
         pt = torch.where(
             true_validity == 1,
             validity_probs,
             torch.ones_like(validity_probs) - validity_probs
         )
         focal_weight = (1 - pt) ** 2
-        
-        # Apply focal weight
         weighted_bce = focal_weight * validity_bce
         
-        # Key improvement: Focus loss on valid tokens if enabled
         if focus_on_valid_tokens:
-            # Only compute loss on positions where we have valid tokens
-            # This prevents model from learning to predict all as invalid
             loss_mask = valid_token_mask
-            # Also include some padding positions to maintain balance
-            # But give much lower weight to padding
-            padding_weight = 0.1  # Weight for padding positions
+            padding_weight = 0.1
             loss_mask = loss_mask + padding_mask * padding_weight
-            
-            # Normalize by the number of valid tokens (not all positions)
             validity_loss = (weighted_bce * loss_mask).sum() / (valid_token_count + padding_count * padding_weight + 1e-8)
         else:
-            # Original: compute loss on all positions
             validity_loss = weighted_bce.mean()
         
-        # Additional metrics for monitoring
-        # Precision: Of all predicted valid tokens, how many are actually valid?
         predicted_valid_mask = (validity_pred == 1).float()
         predicted_valid_count = predicted_valid_mask.sum()
         if predicted_valid_count > 0:
@@ -263,26 +239,24 @@ class EventDecoder(nn.Module):
         else:
             precision = torch.tensor(0.0, device=validity_pred.device)
         
-        # Recall: Of all actual valid tokens, how many did we predict as valid?
         if valid_token_count > 0:
             recall = valid_token_correct.sum() / valid_token_count
         else:
             recall = torch.tensor(0.0, device=validity_pred.device)
         
-        # F1 score
         if precision + recall > 0:
             f1 = 2 * precision * recall / (precision + recall + 1e-8)
         else:
             f1 = torch.tensor(0.0, device=validity_pred.device)
         
         loss_dict = {
-            'validity_acc': overall_acc.item(),  # Overall accuracy (for backward compatibility)
-            'validity_acc_valid_tokens': valid_token_acc.item(),  # Accuracy on valid tokens (most important)
-            'validity_acc_padding': padding_acc.item(),  # Accuracy on padding
-            'validity_precision': precision.item(),  # Precision
-            'validity_recall': recall.item(),  # Recall
-            'validity_f1': f1.item(),  # F1 score
-            'valid_token_ratio': (valid_token_count / (B * N * L + 1e-8)).item()  # Ratio of valid tokens
+            'validity_acc': overall_acc.item(),
+            'validity_acc_valid_tokens': valid_token_acc.item(),
+            'validity_acc_padding': padding_acc.item(),
+            'validity_precision': precision.item(),
+            'validity_recall': recall.item(),
+            'validity_f1': f1.item(),
+            'valid_token_ratio': (valid_token_count / (B * N * L + 1e-8)).item()
         }
         
         return validity_loss, loss_dict
