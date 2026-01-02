@@ -9,7 +9,6 @@ from tqdm import tqdm
 import wandb
 
 from utils.logger import get_logger, MetricLogger
-from models.gaussian_diffusion import TimeAwareGaussianDiffusion
 
 
 class EHRDiffusionTrainer:
@@ -88,12 +87,11 @@ class EHRDiffusionTrainer:
         """
         # Model is set to train mode at epoch start, no need to set it every step
         
-        # Use non_blocking=True for faster data transfer when pin_memory=True
+        # Extract data
         input_ids = batch['input_ids'].to(self.device, non_blocking=True)
         type_ids = batch['type_ids'].to(self.device, non_blocking=True)
         dpe_ids = batch['dpe_ids'].to(self.device, non_blocking=True)
-        con_time = batch['con_time'].to(self.device, non_blocking=True)
-        demographics = batch['demographics'].to(self.device, non_blocking=True) if 'demographics' in batch else None
+        con_time = batch['con_time'].to(self.device, non_blocking=True)  # 保留！作为condition
         
         model = self.model.module if hasattr(self.model, 'module') else self.model
         
@@ -109,52 +107,44 @@ class EHRDiffusionTrainer:
             event_mask = (input_ids > 0).float()
         
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            joint_latent, _, _, _, event_level_mask = model.encode(
-                input_ids, type_ids, dpe_ids, con_time,
-                event_mask=event_mask
+            # 1. Encode (不包含time)
+            event_latent, event_level_mask = model.encode(
+                input_ids, type_ids, dpe_ids, event_mask=event_mask
             )
+            # event_latent: (B, N, 64)
             
-            B = joint_latent.shape[0]
+            # 2. Diffusion (只在event上)
+            B = event_latent.shape[0]
             t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
+            noise = torch.randn_like(event_latent)  # (B, N, 64)
+            noisy_latent = self.diffusion.q_sample(event_latent, t, noise=noise)
             
-            noise = torch.randn_like(joint_latent)
-            if isinstance(self.diffusion, TimeAwareGaussianDiffusion):
-                noisy_latent, actual_noise = self.diffusion.q_sample(joint_latent, t, noise=noise, return_noise=True)
-            else:
-                noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
-                actual_noise = noise
-            
-            prompts_for_dit = model.pattern_prompts.prompts if model.use_prompts else None
-            condition = demographics if self.use_demographics else None
+            # 3. DiT denoise (time作为condition)
             predicted_noise = model.dit(
-                noisy_latent, t,
-                condition=condition,
-                prompts=prompts_for_dit,
-                mask=event_level_mask
+                x=noisy_latent,           # (B, N, 64)
+                t=t,                       # (B,)
+                time_condition=con_time,    # (B, N, 1) - 新增！
+                mask=event_level_mask      # (B, N)
             )
             
+            # 4. Diffusion loss
             diff_loss = F.mse_loss(
                 predicted_noise * event_level_mask.unsqueeze(-1),
-                actual_noise * event_level_mask.unsqueeze(-1),
+                noise * event_level_mask.unsqueeze(-1),
                 reduction='sum'
-            ) / event_level_mask.sum()
+            ) / (event_level_mask.sum() + 1e-8)
             
-            # Compute validity loss for event decoder
-            predicted_x0 = self.diffusion.predict_start_from_noise(
-                noisy_latent, t, predicted_noise
-            )
-            
-            denoised_event_latent = predicted_x0[..., :model.pattern_dim]
+            # 5. Validity loss (和之前一样)
+            denoised_event = self.diffusion.predict_start_from_noise(noisy_latent, t, predicted_noise)
             validity_loss, validity_loss_dict = model.event_decoder.compute_validity_loss(
-                denoised_event_latent,
+                denoised_event,
                 input_ids,
                 mask=event_mask,
                 pos_weight=self.validity_pos_weight,
                 focus_on_valid_tokens=self.focus_on_valid_tokens
             )
             
-            # Loss: diffusion loss + validity loss (weighted)
-            # Note: recon_weight actually weights validity_loss, not a true reconstruction loss
+            # 6. Total loss
             total_loss = diff_loss + self.recon_weight * validity_loss
             total_loss = total_loss / self.gradient_accumulation_steps
         
@@ -196,11 +186,11 @@ class EHRDiffusionTrainer:
         """Validation step"""
         self.model.eval()
         
+        # Extract data
         input_ids = batch['input_ids'].to(self.device)
         type_ids = batch['type_ids'].to(self.device)
         dpe_ids = batch['dpe_ids'].to(self.device)
-        con_time = batch['con_time'].to(self.device)
-        demographics = batch['demographics'].to(self.device) if 'demographics' in batch else None
+        con_time = batch['con_time'].to(self.device)  # 保留！作为condition
         
         model = self.model.module if hasattr(self.model, 'module') else self.model
         
@@ -215,51 +205,44 @@ class EHRDiffusionTrainer:
         else:
             event_mask = (input_ids > 0).float()
         
-        joint_latent, _, _, _, event_level_mask = model.encode(
-            input_ids, type_ids, dpe_ids, con_time,
-            event_mask=event_mask
+        # 1. Encode (不包含time)
+        event_latent, event_level_mask = model.encode(
+            input_ids, type_ids, dpe_ids, event_mask=event_mask
         )
+        # event_latent: (B, N, 64)
         
-        B = joint_latent.shape[0]
+        # 2. Diffusion (只在event上)
+        B = event_latent.shape[0]
         t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
-        noise = torch.randn_like(joint_latent)
+        noise = torch.randn_like(event_latent)  # (B, N, 64)
+        noisy_latent = self.diffusion.q_sample(event_latent, t, noise=noise)
         
-        if isinstance(self.diffusion, TimeAwareGaussianDiffusion):
-            noisy_latent, actual_noise = self.diffusion.q_sample(joint_latent, t, noise=noise, return_noise=True)
-        else:
-            noisy_latent = self.diffusion.q_sample(joint_latent, t, noise=noise)
-            actual_noise = noise
-        
-        prompts_for_dit = model.pattern_prompts.prompts if model.use_prompts else None
-        condition = demographics if self.use_demographics else None
+        # 3. DiT denoise (time作为condition)
         predicted_noise = model.dit(
-            noisy_latent, t,
-            condition=condition,
-            prompts=prompts_for_dit,
-            mask=event_level_mask
+            x=noisy_latent,           # (B, N, 64)
+            t=t,                       # (B,)
+            time_condition=con_time,    # (B, N, 1) - 新增！
+            mask=event_level_mask      # (B, N)
         )
         
+        # 4. Diffusion loss
         diff_loss = F.mse_loss(
             predicted_noise * event_level_mask.unsqueeze(-1),
-            actual_noise * event_level_mask.unsqueeze(-1),
+            noise * event_level_mask.unsqueeze(-1),
             reduction='sum'
-        ) / event_level_mask.sum()
+        ) / (event_level_mask.sum() + 1e-8)
         
-        # Compute validity loss for event decoder (same as training)
-        predicted_x0 = self.diffusion.predict_start_from_noise(
-            noisy_latent, t, predicted_noise
-        )
-        
-        denoised_event_latent = predicted_x0[..., :model.pattern_dim]
+        # 5. Validity loss (和之前一样)
+        denoised_event = self.diffusion.predict_start_from_noise(noisy_latent, t, predicted_noise)
         validity_loss, validity_loss_dict = model.event_decoder.compute_validity_loss(
-            denoised_event_latent,
+            denoised_event,
             input_ids,
             mask=event_mask,
             pos_weight=self.validity_pos_weight,
             focus_on_valid_tokens=self.focus_on_valid_tokens
         )
         
-        # Total loss: diffusion loss + validity loss (weighted)
+        # 6. Total loss
         total_loss = diff_loss + self.recon_weight * validity_loss
         
         loss_dict = {

@@ -1,47 +1,47 @@
 """
-Main training script for EHR Diffusion Model with Pattern Discovery
+Main training script for EHR Diffusion Model (Time-Conditional Baseline)
 """
 
 import os
 import sys
 import argparse
-import json
 import math
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-import numpy as np
-from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from models.dataset import EHRDiffusionDataset, EHRCollator
 from models.ehr_diffusion import EHRDiffusionModel
-from models.gaussian_diffusion import GaussianDiffusion, TimeAwareGaussianDiffusion
+from models.gaussian_diffusion import GaussianDiffusion
 from training.trainer import EHRDiffusionTrainer
 from utils.logger import setup_logger
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train EHR Diffusion Model with Pattern Discovery')
+    parser = argparse.ArgumentParser(description='Train EHR Diffusion Model (Time-Conditional Baseline)')
     
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--obs_window', type=int, default=12)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--use_reduced_vocab', action='store_true')
     
-    parser.add_argument('--use_demographics', action='store_true', default=False)
-    parser.add_argument('--demographic_dim', type=int, default=2)
-    parser.add_argument('--event_dim', type=int, default=64)
-    parser.add_argument('--time_dim', type=int, default=32)
-    parser.add_argument('--pattern_dim', type=int, default=96)
-    parser.add_argument('--num_prompts', type=int, default=16)
-    parser.add_argument('--hidden_dim', type=int, default=512)
-    parser.add_argument('--num_layers', type=int, default=12)
-    parser.add_argument('--num_heads', type=int, default=8)
+    parser.add_argument('--event_dim', type=int, default=64,
+                        help='Dimension of event latent space')
+    parser.add_argument('--hidden_dim', type=int, default=512,
+                        help='Hidden dimension of DiT')
+    parser.add_argument('--num_layers', type=int, default=12,
+                        help='Number of DiT blocks')
+    parser.add_argument('--num_heads', type=int, default=8,
+                        help='Number of attention heads')
     parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--time_condition_dim', type=int, default=None,
+                        help='Dimension for time condition embedding (default: same as hidden_dim)')
+    parser.add_argument('--use_sinusoidal_time', action='store_true', default=True,
+                        help='Use sinusoidal encoding for time (default: True)')
     
     parser.add_argument('--timesteps', type=int, default=1000)
     parser.add_argument('--beta_schedule', type=str, default='linear')
@@ -58,8 +58,6 @@ def parse_args():
     
     parser.add_argument('--recon_weight', type=float, default=0.1, 
                         help='Weight for validity loss (not actual reconstruction loss)')
-    parser.add_argument('--no_prompts', dest='use_prompts', action='store_false',
-                        help='Disable pattern discovery prompts (default: enabled)')
     parser.add_argument('--max_token_len', type=int, default=128)
     
     parser.add_argument('--num_workers', type=int, default=2, 
@@ -247,16 +245,13 @@ def main():
         type_vocab_size=vocab_sizes['type'],
         dpe_vocab_size=vocab_sizes['dpe'],
         event_dim=args.event_dim,
-        time_dim=args.time_dim,
-        pattern_dim=args.pattern_dim,
-        num_prompts=args.num_prompts,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
-        demographic_dim=args.demographic_dim,
         dropout=args.dropout,
         max_token_len=args.max_token_len,
-        use_prompts=getattr(args, 'use_prompts', True)  # Default True if not set
+        time_condition_dim=args.time_condition_dim,
+        use_sinusoidal_time=args.use_sinusoidal_time
     )
     
     model = model.to(device)
@@ -275,9 +270,8 @@ def main():
     logger.info(f"Total parameters: {total_params:,}")
     logger.info(f"Trainable parameters: {trainable_params:,}")
     
-    diffusion = TimeAwareGaussianDiffusion(
-        pattern_dim=model.pattern_dim,
-        time_noise_scale=0.5,
+    # Use standard GaussianDiffusion (time is now a condition, not part of latent)
+    diffusion = GaussianDiffusion(
         timesteps=args.timesteps,
         beta_schedule=args.beta_schedule,
         beta_start=args.beta_start,
@@ -308,8 +302,6 @@ def main():
         'save_interval': args.save_interval,
         'checkpoint_dir': args.checkpoint_dir,
         'recon_weight': args.recon_weight,
-        'use_demographics': args.use_demographics,
-        'use_prompts': getattr(args, 'use_prompts', True),  # Default True if not set
         'max_token_len': args.max_token_len,
         'project_name': args.project_name,
         'run_name': args.run_name,
@@ -318,18 +310,15 @@ def main():
         'type_vocab_size': vocab_sizes['type'],
         'dpe_vocab_size': vocab_sizes['dpe'],
         'event_dim': args.event_dim,
-        'time_dim': args.time_dim,
-        'pattern_dim': args.pattern_dim,
-        'num_prompts': args.num_prompts,
         'hidden_dim': args.hidden_dim,
         'num_layers': args.num_layers,
         'num_heads': args.num_heads,
-        'demographic_dim': args.demographic_dim,
+        'time_condition_dim': args.time_condition_dim,
+        'use_sinusoidal_time': args.use_sinusoidal_time,
         'timesteps': args.timesteps,
         'beta_schedule': args.beta_schedule,
         'beta_start': args.beta_start,
-        'beta_end': args.beta_end,
-        'time_noise_scale': 0.5  # Time noise scaling used in TimeAwareGaussianDiffusion
+        'beta_end': args.beta_end
     }
     
     trainer = EHRDiffusionTrainer(

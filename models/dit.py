@@ -1,6 +1,7 @@
 """
 Diffusion Transformer (DiT) for EHR Latent Space
-Event-level sequence modeling with timestep + prompt conditioning
+Event-level sequence modeling with timestep + time conditioning (baseline version)
+Time is used as condition, not generated
 """
 
 import torch
@@ -55,8 +56,89 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
+class TimeConditioner(nn.Module):
+    """
+    Time Conditioner: Encodes time values (log1p(cumulative_minutes)) into conditioning embeddings
+    
+    Options:
+    - Simple MLP: Direct projection
+    - Sinusoidal: Similar to positional encoding (better for extrapolation)
+    
+    Args:
+        time_dim: Input time dimension (default: 1 for scalar time)
+        condition_dim: Output condition dimension (should match hidden_dim)
+        use_sinusoidal: Whether to use sinusoidal encoding
+        num_frequencies: Number of frequency bands for sinusoidal encoding
+    """
+    
+    def __init__(
+        self,
+        time_dim: int = 1,
+        condition_dim: int = 512,
+        use_sinusoidal: bool = True,
+        num_frequencies: int = 16,
+        max_time: float = 8.0
+    ):
+        super().__init__()
+        self.time_dim = time_dim
+        self.condition_dim = condition_dim
+        self.use_sinusoidal = use_sinusoidal
+        
+        if use_sinusoidal:
+            # Sinusoidal encoding (similar to positional encoding)
+            # Good for extrapolation and periodicity
+            freq_bands = torch.pow(
+                max_time,
+                -torch.linspace(0, 1, num_frequencies, dtype=torch.float32)
+            )
+            self.register_buffer('freq_bands', freq_bands)
+            
+            # Project sinusoidal features to condition_dim
+            sin_cos_dim = num_frequencies * 2  # sin + cos
+            self.proj = nn.Sequential(
+                nn.Linear(sin_cos_dim, condition_dim),
+                nn.SiLU(),
+                nn.Linear(condition_dim, condition_dim)
+            )
+        else:
+            # Simple MLP
+            self.proj = nn.Sequential(
+                nn.Linear(time_dim, condition_dim),
+                nn.SiLU(),
+                nn.Linear(condition_dim, condition_dim)
+            )
+    
+    def forward(self, time_values):
+        """
+        Args:
+            time_values: (B, N, 1) - log1p(cumulative_minutes), padding=-1.0
+        
+        Returns:
+            time_cond: (B, N, condition_dim) - time conditioning embeddings
+        """
+        if self.use_sinusoidal:
+            # Sinusoidal encoding
+            # time_values: (B, N, 1)
+            angles = time_values * self.freq_bands.unsqueeze(0).unsqueeze(0)  # (B, N, num_frequencies)
+            sin_features = torch.sin(angles)
+            cos_features = torch.cos(angles)
+            sin_cos = torch.cat([sin_features, cos_features], dim=-1)  # (B, N, 2*num_frequencies)
+            time_cond = self.proj(sin_cos)  # (B, N, condition_dim)
+        else:
+            # Simple MLP
+            time_cond = self.proj(time_values)  # (B, N, condition_dim)
+        
+        return time_cond
+
+
 class AdaptiveLayerNorm(nn.Module):
-    """Adaptive Layer Normalization conditioned on timestep and demographics"""
+    """
+    Adaptive Layer Normalization conditioned on timestep and time
+    
+    Now supports:
+    - Timestep embedding (diffusion timestep)
+    - Time conditioning (event time values)
+    """
     
     def __init__(self, hidden_dim, condition_dim):
         super().__init__()
@@ -70,7 +152,7 @@ class AdaptiveLayerNorm(nn.Module):
         """
         Args:
             x: (B, N, D) - input features
-            c: (B, C) - condition embedding
+            c: (B, C) - combined condition embedding (timestep + time)
         Returns:
             (B, N, D) - modulated features
         """
@@ -81,7 +163,10 @@ class AdaptiveLayerNorm(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """Standard DiT block with self-attention"""
+    """
+    Standard DiT block with self-attention
+    Now uses combined conditioning (timestep + time)
+    """
     
     def __init__(
         self,
@@ -115,7 +200,7 @@ class DiTBlock(nn.Module):
         """
         Args:
             x: (B, N, D) - input sequence
-            c: (B, C) - condition embedding
+            c: (B, C) - combined condition embedding (timestep + time pooled)
             mask: (B, N) - attention mask
         Returns:
             (B, N, D) - output sequence
@@ -228,88 +313,80 @@ class PromptCrossAttentionBlock(nn.Module):
 
 class DiT(nn.Module):
     """
-    Diffusion Transformer for EHR Latent Denoising
+    Diffusion Transformer for EHR Latent Denoising (Baseline Version)
     
-    Updates:
-        - Supports prompt cross-attention (optional)
-        - Prompts guide denoising process with learned patterns
+    Architecture:
+        - Time-conditional generation: p(event | time)
+        - Time is used as condition, not generated
+        - Only event latent (64d) goes through diffusion
+        - Time conditioning via AdaLN modulation
     
     Args:
-        latent_dim: Dimension of input latent (event_refined + time_refined, NO boundary)
+        latent_dim: Dimension of event latent (default: 64, only event, no time)
         hidden_dim: Hidden dimension of transformer
         num_layers: Number of transformer layers
         num_heads: Number of attention heads
-        condition_dim: Dimension of conditioning (demographics)
         dropout: Dropout rate
         mlp_ratio: MLP hidden dimension ratio
-        use_prompts: Whether to use prompt cross-attention
+        time_condition_dim: Dimension for time conditioning (default: same as hidden_dim)
+        use_sinusoidal_time: Whether to use sinusoidal encoding for time
     """
     
     def __init__(
         self,
-        latent_dim: int = 192,  # 96 (event_refined) + 96 (time_refined), NO boundary
+        latent_dim: int = 64,  # Only event latent, no time
         hidden_dim: int = 512,
-        num_layers: int = 12,
+        num_layers: int = 8,  # Can reduce from 12
         num_heads: int = 8,
-        condition_dim: int = 2,
         dropout: float = 0.1,
         mlp_ratio: float = 4.0,
-        use_prompts: bool = True
+        time_condition_dim: int = None,
+        use_sinusoidal_time: bool = True
     ):
         super().__init__()
         
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
-        self.use_prompts = use_prompts
+        
+        if time_condition_dim is None:
+            time_condition_dim = hidden_dim
         
         # Input projection
         self.input_proj = nn.Linear(latent_dim, hidden_dim)
         
-        # Timestep embedder
-        self.time_embedder = TimestepEmbedder(hidden_dim)
+        # Timestep embedder (for diffusion timestep)
+        self.timestep_embedder = TimestepEmbedder(hidden_dim)
         
-        # Condition (demographics) embedder
-        self.condition_embedder = nn.Sequential(
-            nn.Linear(condition_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+        # Time conditioner (for event time values)
+        self.time_conditioner = TimeConditioner(
+            time_dim=1,
+            condition_dim=time_condition_dim,
+            use_sinusoidal=use_sinusoidal_time
         )
         
-        # Combined condition dimension
+        # Project time condition to hidden_dim if dimensions don't match
+        if time_condition_dim != hidden_dim:
+            self.time_cond_proj = nn.Linear(time_condition_dim, hidden_dim)
+        else:
+            self.time_cond_proj = None
+        
+        # Combined condition dimension (timestep + time)
         combined_condition_dim = hidden_dim
         
         # Positional embedding for events
         self.pos_embedding = nn.Parameter(torch.randn(1, 256, hidden_dim) * 0.02)
         
-        # Prompt projection (if using prompts)
-        if use_prompts:
-            # Prompts come from PatternDiscoveryPrompts with hidden_dim=96
-            # Need to project to DiT's hidden_dim
-            self.prompt_proj = nn.Linear(96, hidden_dim)
-            
-            # Transformer blocks with prompt cross-attention
-            self.blocks = nn.ModuleList([
-                PromptCrossAttentionBlock(
-                    hidden_dim,
-                    num_heads,
-                    combined_condition_dim,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout
-                )
-                for _ in range(num_layers)
-            ])
-        else:
-            # Standard transformer blocks
-            self.blocks = nn.ModuleList([
-                DiTBlock(
-                    hidden_dim,
-                    num_heads,
-                    combined_condition_dim,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout
-                )
-                for _ in range(num_layers)
-            ])
+        # Transformer blocks (no prompts, pure self-attention)
+        self.blocks = nn.ModuleList([
+            DiTBlock(
+                hidden_dim,
+                num_heads,
+                combined_condition_dim,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout
+            )
+            for _ in range(num_layers)
+        ])
         
         # Output projection
         self.final_norm = nn.LayerNorm(hidden_dim)
@@ -329,14 +406,13 @@ class DiT(nn.Module):
             if module.weight is not None:
                 nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, x, t, condition=None, prompts=None, mask=None):
+    def forward(self, x, t, time_condition=None, mask=None):
         """
         Args:
-            x: (B, N, latent_dim) - noisy latent codes
-            t: (B,) - timestep indices
-            condition: (B, condition_dim) - demographics
-            prompts: (P, dim) or (B, P, dim) - pattern prompts (optional)
-                     If shape is (P, dim), will be expanded to (B, P, dim) internally
+            x: (B, N, latent_dim) - noisy event latent codes (64d)
+            t: (B,) - diffusion timestep indices
+            time_condition: (B, N, 1) - time values (log1p(cumulative_minutes))
+                           If None, will use null condition (time=0)
             mask: (B, N) - valid event mask
             
         Returns:
@@ -348,33 +424,39 @@ class DiT(nn.Module):
         x = self.input_proj(x)  # (B, N, hidden_dim)
         x = x + self.pos_embedding[:, :N, :]
         
-        # Embed timestep
-        t_emb = self.time_embedder(t)  # (B, hidden_dim)
+        # Embed diffusion timestep
+        timestep_emb = self.timestep_embedder(t)  # (B, hidden_dim)
         
-        # Embed condition (demographics)
-        if condition is not None:
-            c_emb = self.condition_embedder(condition)  # (B, hidden_dim)
-            c = t_emb + c_emb
+        # Process time condition
+        if time_condition is not None:
+            # time_condition: (B, N, 1) - log1p(cumulative_minutes)
+            time_cond = self.time_conditioner(time_condition)  # (B, N, time_condition_dim)
+            
+            # Pool time condition to (B, hidden_dim) for AdaLN
+            # Option 1: Mean pooling (simple)
+            if mask is not None:
+                # Mask out padding positions
+                mask_expanded = mask.unsqueeze(-1).float()  # (B, N, 1)
+                time_cond_pooled = (time_cond * mask_expanded).sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-8)  # (B, time_condition_dim)
+            else:
+                time_cond_pooled = time_cond.mean(dim=1)  # (B, time_condition_dim)
+            
+            # Project to hidden_dim if needed
+            if self.time_cond_proj is not None:
+                time_cond_pooled = self.time_cond_proj(time_cond_pooled)
+            
+            # Combine timestep and time condition
+            combined_cond = timestep_emb + time_cond_pooled  # (B, hidden_dim)
         else:
-            c = t_emb
-        
-        # Handle prompts: expand if needed (optimization to avoid redundant expand in trainer)
-        if self.use_prompts and prompts is not None:
-            if prompts.dim() == 2:
-                # Prompts shape: (P, dim) - expand to (B, P, dim)
-                prompts = prompts.unsqueeze(0).expand(B, -1, -1)
-            # Now prompts is (B, P, dim)
-            prompts = self.prompt_proj(prompts)  # (B, P, hidden_dim)
+            # Null condition: only use timestep
+            combined_cond = timestep_emb  # (B, hidden_dim)
         
         # Apply transformer blocks
         for block in self.blocks:
-            if self.use_prompts:
-                x = block(x, c, prompts=prompts, mask=mask)
-            else:
-                x = block(x, c, mask=mask)
+            x = block(x, combined_cond, mask=mask)
         
         # Output projection
         x = self.final_norm(x)
-        x = self.output_proj(x)
+        x = self.output_proj(x)  # (B, N, latent_dim)
         
         return x
