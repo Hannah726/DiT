@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 import wandb
-from typing import Optional
 
 from utils.logger import get_logger, MetricLogger
 from models.gaussian_diffusion import TimeAwareGaussianDiffusion
@@ -58,6 +57,10 @@ class EHRDiffusionTrainer:
         self.use_demographics = config.get('use_demographics', False)
         self.gradient_accumulation_steps = config.get('gradient_accumulation_steps', 1)
         
+        # Validity loss configuration
+        self.focus_on_valid_tokens = config.get('focus_on_valid_tokens', True)
+        self.validity_pos_weight = config.get('validity_pos_weight', None)  # None = auto-compute
+        
         if self.gradient_accumulation_steps > 1:
             self.logger.info(f"Using Gradient Accumulation with {self.gradient_accumulation_steps} steps")
         
@@ -106,7 +109,7 @@ class EHRDiffusionTrainer:
             event_mask = (input_ids > 0).float()
         
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            joint_latent, event_refined, time_refined, prompt_weights, event_level_mask = model.encode(
+            joint_latent, _, _, _, event_level_mask = model.encode(
                 input_ids, type_ids, dpe_ids, con_time,
                 event_mask=event_mask
             )
@@ -145,18 +148,10 @@ class EHRDiffusionTrainer:
             validity_loss, validity_loss_dict = model.event_decoder.compute_validity_loss(
                 denoised_event_latent,
                 input_ids,
-                mask=event_mask
+                mask=event_mask,
+                pos_weight=self.validity_pos_weight,
+                focus_on_valid_tokens=self.focus_on_valid_tokens
             )
-            
-            # Also compute accuracy on ground truth latent for better monitoring
-            # This shows validity head learning progress independent of denoising quality
-            _, gt_validity_dict = model.event_decoder.compute_validity_loss(
-                joint_latent[..., :model.pattern_dim],
-                input_ids,
-                mask=event_mask
-            )
-            # Rename to distinguish from denoised-based accuracy
-            gt_validity_dict = {f'gt_{k}': v for k, v in gt_validity_dict.items()}
             
             # Loss: diffusion loss + validity loss (weighted)
             # Note: recon_weight actually weights validity_loss, not a true reconstruction loss
@@ -193,7 +188,6 @@ class EHRDiffusionTrainer:
             'validity_loss': validity_loss.item()
         }
         loss_dict.update({f'validity_{k}': v for k, v in validity_loss_dict.items()})
-        loss_dict.update(gt_validity_dict)  # Add ground truth based accuracy
         
         return loss_dict
     
@@ -221,7 +215,7 @@ class EHRDiffusionTrainer:
         else:
             event_mask = (input_ids > 0).float()
         
-        joint_latent, event_refined, time_refined, prompt_weights, event_level_mask = model.encode(
+        joint_latent, _, _, _, event_level_mask = model.encode(
             input_ids, type_ids, dpe_ids, con_time,
             event_mask=event_mask
         )
@@ -260,7 +254,9 @@ class EHRDiffusionTrainer:
         validity_loss, validity_loss_dict = model.event_decoder.compute_validity_loss(
             denoised_event_latent,
             input_ids,
-            mask=event_mask
+            mask=event_mask,
+            pos_weight=self.validity_pos_weight,
+            focus_on_valid_tokens=self.focus_on_valid_tokens
         )
         
         # Total loss: diffusion loss + validity loss (weighted)
