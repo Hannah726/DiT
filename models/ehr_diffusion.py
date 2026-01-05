@@ -127,20 +127,22 @@ class EHRDiffusionModel(nn.Module):
         
         return event_latent, event_level_mask
     
-    def decode(self, event_latent, return_logits=False):
+    def decode(self, event_latent, return_logits=False, validity_threshold=0.5):
         """
         Decode event latent back to tokens
         
         Args:
             event_latent: (B, N, event_dim) - event latents
             return_logits: Whether to return logits
+            validity_threshold: Threshold for validity prediction (default: 0.5)
         
         Returns:
             dict with keys 'token', 'type', 'dpe' (and 'validity' if return_logits=True)
         """
         return self.event_decoder(
             event_latent,
-            return_logits=return_logits
+            return_logits=return_logits,
+            validity_threshold=validity_threshold
         )
     
     def forward(self, input_ids, type_ids, dpe_ids, event_mask=None):

@@ -13,25 +13,28 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from models.ehr_diffusion import EHRDiffusionModel
-from models.scheduler import DDIMScheduler
+from models.archive.scheduler import DDIMScheduler
 from utils.vocab_utils import load_id2word, convert_token_ids_to_input
 
 
 class DDIMSampler:
     
-    def __init__(self, model, scheduler, device='cuda', time_condition=None):
+    def __init__(self, model, scheduler, device='cuda', time_condition=None, validity_threshold=0.7):
         """
         Args:
             model: EHRDiffusionModel
             scheduler: DDIMScheduler
             device: Device to run on
             time_condition: (B, N, 1) time condition tensor, or None to sample from data
+            validity_threshold: Threshold for validity prediction (default: 0.7).
+                                Higher values reduce false positives (fewer valid tokens).
         """
         self.model = model
         self.scheduler = scheduler
         self.device = device
         self.model.eval()
         self.time_condition = time_condition
+        self.validity_threshold = validity_threshold
     
     @torch.no_grad()
     def sample(
@@ -157,7 +160,7 @@ class DDIMSampler:
             )
         
         # Decode event latent to tokens
-        decoded_events = model.decode(x, return_logits=False)
+        decoded_events = model.decode(x, return_logits=False, validity_threshold=self.validity_threshold)
         
         # Time is not decoded from latent, return the time condition used
         batch_output = {
@@ -228,6 +231,8 @@ def parse_args():
     
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--validity_threshold', type=float, default=0.7,
+                        help='Threshold for validity prediction (default: 0.7). Higher values reduce false positives.')
     
     return parser.parse_args()
 
@@ -345,7 +350,8 @@ def main():
         model, 
         scheduler, 
         device,
-        time_condition=time_condition
+        time_condition=time_condition,
+        validity_threshold=args.validity_threshold
     )
     
     print(f"\nGenerating {args.num_samples} samples...")

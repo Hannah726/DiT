@@ -59,6 +59,21 @@ class EHRDiffusionTrainer:
         # Validity loss configuration
         self.focus_on_valid_tokens = config.get('focus_on_valid_tokens', True)
         self.validity_pos_weight = config.get('validity_pos_weight', None)  # None = auto-compute
+        self.padding_weight = config.get('padding_weight', 0.5)  # Weight for padding in validity loss (default: 0.5)
+        
+        # Simple early stopping: stop if no improvement for N training epochs
+        self.early_stopping_patience = config.get('early_stopping_patience', None)
+        if self.early_stopping_patience is not None:
+            # Auto-calculate patience if not set: 15% of total epochs
+            if self.early_stopping_patience == 0:
+                total_epochs = config.get('epochs', 100)
+                self.early_stopping_patience = max(5, min(20, int(total_epochs * 0.15)))
+            self.no_improve_epochs = 0  # Count training epochs since last improvement
+            self.last_improve_epoch = -1  # Track which epoch had last improvement
+            self.logger.info(f"Early stopping enabled: patience={self.early_stopping_patience} training epochs")
+        else:
+            self.no_improve_epochs = 0
+            self.last_improve_epoch = -1
         
         if self.gradient_accumulation_steps > 1:
             self.logger.info(f"Using Gradient Accumulation with {self.gradient_accumulation_steps} steps")
@@ -141,7 +156,8 @@ class EHRDiffusionTrainer:
                 input_ids,
                 mask=event_mask,
                 pos_weight=self.validity_pos_weight,
-                focus_on_valid_tokens=self.focus_on_valid_tokens
+                focus_on_valid_tokens=self.focus_on_valid_tokens,
+                padding_weight=self.padding_weight
             )
             
             # 6. Total loss
@@ -239,7 +255,8 @@ class EHRDiffusionTrainer:
             input_ids,
             mask=event_mask,
             pos_weight=self.validity_pos_weight,
-            focus_on_valid_tokens=self.focus_on_valid_tokens
+            focus_on_valid_tokens=self.focus_on_valid_tokens,
+            padding_weight=self.padding_weight
         )
         
         # 6. Total loss
@@ -299,8 +316,13 @@ class EHRDiffusionTrainer:
         
         return metric_logger.get_dict()
     
-    def save_checkpoint(self, is_best=False):
-        """Save checkpoint"""
+    def save_checkpoint(self, is_best=False, is_epoch_checkpoint=False):
+        """Save checkpoint
+        
+        Args:
+            is_best: If True, save as best_checkpoint.pt
+            is_epoch_checkpoint: If True, save as epoch_{epoch}.pt (periodic saves)
+        """
         if self.rank != 0:
             return
         
@@ -321,13 +343,19 @@ class EHRDiffusionTrainer:
         checkpoint_dir = self.config['checkpoint_dir']
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        checkpoint_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
-        torch.save(checkpoint, checkpoint_path)
+        # Always save latest checkpoint
+        latest_path = os.path.join(checkpoint_dir, 'latest_checkpoint.pt')
+        torch.save(checkpoint, latest_path)
         
         if is_best:
             best_path = os.path.join(checkpoint_dir, 'best_checkpoint.pt')
             torch.save(checkpoint, best_path)
-            self.logger.info(f"Saved best checkpoint to {best_path}")
+            self.logger.info(f"Saved best checkpoint (val_loss={self.best_val_loss:.6f}) to {best_path}")
+        
+        if is_epoch_checkpoint:
+            epoch_path = os.path.join(checkpoint_dir, f'epoch_{self.current_epoch}.pt')
+            torch.save(checkpoint, epoch_path)
+            self.logger.info(f"Saved epoch checkpoint to {epoch_path}")
     
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint"""
@@ -347,21 +375,51 @@ class EHRDiffusionTrainer:
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
         self.logger.info(f"Resuming from epoch {self.current_epoch}, step {self.global_step}")
     
+    
     def train(self):
-        """Main training loop"""
+        """Main training loop with early stopping"""
         for epoch in range(self.current_epoch, self.config['epochs']):
             self.current_epoch = epoch
             
             train_metrics = self.train_epoch()
             
+            # Validation
             if epoch % self.config['val_interval'] == 0:
                 val_metrics = self.validate()
+                val_loss = val_metrics['total_loss']
                 
-                if val_metrics['total_loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['total_loss']
+                # Check for improvement
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.last_improve_epoch = epoch
+                    self.no_improve_epochs = 0  # Reset counter
                     self.save_checkpoint(is_best=True)
+                    self.logger.info(f"Validation loss improved to {val_loss:.6f}")
+                else:
+                    # Calculate training epochs since last improvement
+                    if self.last_improve_epoch >= 0:
+                        self.no_improve_epochs = epoch - self.last_improve_epoch
+                    else:
+                        # First validation: initialize best loss and improve epoch
+                        self.best_val_loss = val_loss
+                        self.last_improve_epoch = epoch
+                        self.no_improve_epochs = 0
+                    
+                    if self.early_stopping_patience is not None:
+                        self.logger.info(f"Validation loss: {val_loss:.6f} (best: {self.best_val_loss:.6f}, no improve: {self.no_improve_epochs}/{self.early_stopping_patience} epochs)")
+                
+                # Early stopping check (counted in training epochs)
+                if self.early_stopping_patience is not None and self.no_improve_epochs >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping: no improvement for {self.early_stopping_patience} training epochs")
+                    self.logger.info(f"Best validation loss: {self.best_val_loss:.6f} (epoch {self.last_improve_epoch})")
+                    break
             
-            if epoch % self.config['save_interval'] == 0:
-                self.save_checkpoint(is_best=False)
+            # Periodic checkpoint saving
+            if epoch > 0 and epoch % self.config['save_interval'] == 0:
+                self.save_checkpoint(is_best=False, is_epoch_checkpoint=True)
+            
+            # Save latest at end
+            if epoch == self.config['epochs'] - 1:
+                self.save_checkpoint(is_best=False, is_epoch_checkpoint=False)
         
         self.logger.info("Training completed.")

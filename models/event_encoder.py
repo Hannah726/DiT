@@ -31,11 +31,12 @@ class ChannelEmbedding(nn.Module):
         return emb
 
 
-class CrossChannelFusion(nn.Module):
+class SimpleChannelFusion(nn.Module):
     """
-    Gated fusion of multiple channels
+    Simple addition-based fusion of multiple channels
+    Directly adds token/type/dpe embeddings after projection to same dimension
+    This is more suitable when input has high variance while type/dpe are stable
     """
-    
     def __init__(self, channel_dims: dict, hidden_dim: int):
         """
         Args:
@@ -45,19 +46,14 @@ class CrossChannelFusion(nn.Module):
         super().__init__()
         self.channel_names = list(channel_dims.keys())
         
-        # Per-channel projections
+        # Per-channel projections to same dimension with LayerNorm
+        # LayerNorm helps normalize each channel before addition
         self.channel_projs = nn.ModuleDict({
-            f'proj_{name}': nn.Linear(dim, hidden_dim)
-            for name, dim in channel_dims.items()
-        })
-        
-        # Gating mechanism
-        self.gate_nets = nn.ModuleDict({
-            f'gate_{name}': nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.Sigmoid()
+            f'proj_{name}': nn.Sequential(
+                nn.Linear(dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),   # Normalize each channel before addition
             )
-            for name in channel_dims.keys()
+            for name, dim in channel_dims.items()
         })
         
     def forward(self, channel_embs: dict):
@@ -66,24 +62,17 @@ class CrossChannelFusion(nn.Module):
             channel_embs: dict of {channel_name: (B, L, D_c)}
             
         Returns:
-            (B, L, hidden_dim) - fused representation
+            (B, L, hidden_dim) - fused representation by direct addition
         """
-        # Project each channel
-        projected = {}
-        for name in self.channel_names:
-            projected[name] = self.channel_projs[f'proj_{name}'](channel_embs[name])
-        
-        # Compute gates based on mean-pooled representations
-        gates = {}
-        for name in self.channel_names:
-            pooled = projected[name].mean(dim=1, keepdim=True)  # (B, 1, D)
-            gates[name] = self.gate_nets[f'gate_{name}'](pooled)  # (B, 1, D)
-        
-        # Weighted sum
-        fused = sum(gates[name] * projected[name] for name in self.channel_names)
+        # Project each channel to same dimension
+        projected = {
+            name: self.channel_projs[f'proj_{name}'](channel_embs[name])
+            for name in self.channel_names
+        }
+
+        fused = sum(projected.values())
         
         return fused
-
 
 class AttentionPooling(nn.Module):
     """
@@ -126,7 +115,7 @@ class StructuredEventEncoder(nn.Module):
     
     Architecture:
         1. Channel-specific embeddings
-        2. Cross-channel gated fusion
+        2. Simple addition-based fusion (direct sum of token/type/dpe)
         3. Attention pooling across tokens
         4. Final projection to event_dim
     """
@@ -149,8 +138,8 @@ class StructuredEventEncoder(nn.Module):
         self.type_emb = ChannelEmbedding(vocab_sizes['type'], embed_dims['type'], padding_idx)
         self.dpe_emb = ChannelEmbedding(vocab_sizes['dpe'], embed_dims['dpe'], padding_idx)
         
-        # Cross-channel fusion
-        self.fusion = CrossChannelFusion(embed_dims, hidden_dim)
+        # Simple addition-based fusion (direct sum, no gating)
+        self.fusion = SimpleChannelFusion(embed_dims, hidden_dim)
         
         # Attention pooling
         self.pooling = AttentionPooling(hidden_dim)

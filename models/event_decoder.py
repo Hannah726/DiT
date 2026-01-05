@@ -98,11 +98,13 @@ class EventDecoder(nn.Module):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, event_latents, return_logits=False):
+    def forward(self, event_latents, return_logits=False, validity_threshold=0.5):
         """
         Args:
             event_latents: (B, N, event_dim) - event latent vectors
             return_logits: Whether to return raw logits or sampled IDs
+            validity_threshold: Threshold for validity prediction (default: 0.5).
+                                Higher values reduce false positives (fewer valid tokens).
         
         Returns:
             If return_logits=True:
@@ -112,7 +114,7 @@ class EventDecoder(nn.Module):
             Else:
                 dict with keys 'token', 'type', 'dpe'
                 - Each: (B, N, L) - sampled IDs with padding=0
-                - Tokens are masked by validity scores (validity > 0.5)
+                - Tokens are masked by validity scores (validity > threshold)
         """
         B, N, _ = event_latents.shape
         L = self.max_token_len
@@ -146,7 +148,7 @@ class EventDecoder(nn.Module):
             
             # Convert validity logits to probabilities for masking
             validity_probs = torch.sigmoid(validity_logits)
-            validity_mask = (validity_probs > 0.5).float()
+            validity_mask = (validity_probs > validity_threshold).float()
             token_ids = token_ids * validity_mask.long()
             type_ids = type_ids * validity_mask.long()
             dpe_ids = dpe_ids * validity_mask.long()
@@ -158,7 +160,7 @@ class EventDecoder(nn.Module):
             }
     
     def compute_validity_loss(self, event_latents, target_tokens, mask=None, 
-                             pos_weight=None, focus_on_valid_tokens=True):
+                             pos_weight=None, focus_on_valid_tokens=True, padding_weight=0.1):
         """
         Compute validity loss with improved accuracy and loss calculation
         
@@ -170,6 +172,8 @@ class EventDecoder(nn.Module):
                        If None, will be computed automatically based on class balance.
             focus_on_valid_tokens: If True, only compute loss on valid token positions.
                                   This prevents model from learning to predict all tokens as invalid.
+            padding_weight: Weight for padding tokens in loss calculation (default: 0.1).
+                            Increase this to penalize padding misclassification more.
         
         Returns:
             loss: Scalar validity loss
@@ -187,6 +191,7 @@ class EventDecoder(nn.Module):
             true_validity = true_validity * mask
         
         validity_probs = torch.sigmoid(logits['validity'])
+        # Use 0.5 for training metrics (consistent with loss calculation)
         validity_pred = (validity_probs > 0.5).float()
         
         valid_token_mask = (true_validity == 1).float()
@@ -226,7 +231,6 @@ class EventDecoder(nn.Module):
         
         if focus_on_valid_tokens:
             loss_mask = valid_token_mask
-            padding_weight = 0.1
             loss_mask = loss_mask + padding_mask * padding_weight
             validity_loss = (weighted_bce * loss_mask).sum() / (valid_token_count + padding_count * padding_weight + 1e-8)
         else:

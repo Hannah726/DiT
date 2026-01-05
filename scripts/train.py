@@ -56,6 +56,8 @@ def parse_args():
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--warmup_steps', type=int, default=1000)
     
+    parser.add_argument('--padding_weight', type=float, default=0.5,
+                        help='Weight for padding tokens in validity loss (default: 0.5). Increase to penalize padding misclassification more.')
     parser.add_argument('--recon_weight', type=float, default=0.1, 
                         help='Weight for validity loss (not actual reconstruction loss)')
     parser.add_argument('--max_token_len', type=int, default=128)
@@ -71,7 +73,12 @@ def parse_args():
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--log_interval', type=int, default=100)
     parser.add_argument('--val_interval', type=int, default=1)
-    parser.add_argument('--save_interval', type=int, default=5)
+    parser.add_argument('--save_interval', type=int, default=5,
+                        help='Save checkpoint every N epochs (saved as epoch_N.pt)')
+    parser.add_argument('--early_stopping_patience', type=int, default=None,
+                        help='Early stopping patience (number of epochs without improvement). None = disabled')
+    parser.add_argument('--early_stopping_min_delta', type=float, default=0.0,
+                        help='Minimum change in validation loss to qualify as improvement')
     parser.add_argument('--compile_model', action='store_true', default=False,
                         help='Use torch.compile to optimize model (PyTorch 2.0+)')
     
@@ -330,8 +337,11 @@ def main():
         'log_interval': args.log_interval,
         'val_interval': args.val_interval,
         'save_interval': args.save_interval,
+        'early_stopping_patience': args.early_stopping_patience,
+        'early_stopping_min_delta': args.early_stopping_min_delta,
         'checkpoint_dir': args.checkpoint_dir,
         'recon_weight': args.recon_weight,
+        'padding_weight': args.padding_weight,
         'max_token_len': args.max_token_len,
         'project_name': args.project_name,
         'run_name': args.run_name,
