@@ -96,7 +96,7 @@ def encode_to_codes(model, data, batch_size=32, device='cuda'):
         device: Device to run on
     
     Returns:
-        codes: (N, max_events, num_codes) array of discrete codes
+        codes: (N, M, num_codes) array of discrete codes
     """
     input_ids = data['input_ids']
     type_ids = data['type_ids']
@@ -125,23 +125,18 @@ def encode_to_codes(model, data, batch_size=32, device='cuda'):
                 dpe_ids=batch_dpe
             )
             
-            if 'quantized_indices' in net_output:
-                codes = net_output['quantized_indices']
-            elif 'codes' in net_output:
-                codes = net_output['codes']
-            else:
+            if 'enc_indices' not in net_output:
                 raise KeyError(
-                    f"Cannot find codes in model output. "
+                    f"No encoded indices found in model output. "
                     f"Available keys: {net_output.keys()}"
                 )
-            
-            codes_np = codes.cpu().numpy()
+            codes = net_output['enc_indices']
+            codes_np = codes.cpu().numpy().reshape(batch_size, M, -1)
+
             all_codes.append(codes_np)
-            
             torch.cuda.empty_cache()
     
     all_codes = np.concatenate(all_codes, axis=0)
-    
     print(f"\nEncoded codes shape: {all_codes.shape}")
     print(f"Code value range: [{all_codes.min()}, {all_codes.max()}]")
     
@@ -156,22 +151,9 @@ def verify_codes(codes, codebook_size=1024):
         codes: Encoded codes array
         codebook_size: Expected codebook size
     """
-    print("\nVerifying codes...")
-    
-    unique_codes = np.unique(codes)
-    print(f"Unique code values: {len(unique_codes)}")
-    print(f"Code range: [{codes.min()}, {codes.max()}]")
-    
-    if codes.max() >= codebook_size:
-        print(f"WARNING: Code values exceed codebook size {codebook_size}")
-    
-    if codes.min() < 0:
-        print(f"WARNING: Negative code values found")
-    
-    valid_ratio = (codes >= 0) & (codes < codebook_size)
-    print(f"Valid codes: {valid_ratio.sum() / codes.size * 100:.2f}%")
-    
-    print("Verification complete.")
+    assert codes.max() < codebook_size, f"Code values {codes.max()} exceed codebook size {codebook_size}"
+    assert codes.min() >= 0, f"Negative code values found: {codes.min()}"
+    assert codes.shape[-1] == 8, f"Expected 8 codes per event, got {codes.shape[-1]}"
 
 
 def main():

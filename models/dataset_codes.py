@@ -52,22 +52,20 @@ class EHRCodesDataset(Dataset):
         
         self.indices = self.cohort[self.cohort[split_col] == split].index.tolist()
         
-        print(f"[CodesDataset] Loading {split} split (seed={seed}): {len(self.indices)} samples")
-        
+        # Load codes
         codes_file = os.path.join(codes_dir, 'mimiciv_hi_code.npy')
         if not os.path.exists(codes_file):
             raise FileNotFoundError(
                 f"Codes file not found: {codes_file}\n"
                 f"Please run encode_with_rqvae.py first to generate codes."
             )
-        
         self.codes = np.load(codes_file, mmap_mode='r')
         
-        time_file = os.path.join(data_dir, f'mimiciv_con_time_{obs_window}.npy')
+        # Load discrete time tokens
+        time_file = os.path.join(data_dir, 'mimiciv_hi_time.npy')
         if not os.path.exists(time_file):
             raise FileNotFoundError(f"Time file not found: {time_file}")
-        
-        self.con_time = np.load(time_file, mmap_mode='r')
+        self.time_ids = np.load(time_file, mmap_mode='r', allow_pickle=True)
         
         if max_events is None:
             self.max_events = self.codes.shape[1]
@@ -75,11 +73,6 @@ class EHRCodesDataset(Dataset):
             self.max_events = max_events
         
         self.num_codes = self.codes.shape[2] if len(self.codes.shape) > 2 else 8
-        
-        print(f"[CodesDataset] Codes shape: {self.codes.shape}")
-        print(f"[CodesDataset] Time shape: {self.con_time.shape}")
-        print(f"[CodesDataset] Max events: {self.max_events}")
-        print(f"[CodesDataset] Num codes per event: {self.num_codes}")
     
     def __len__(self) -> int:
         return len(self.indices)
@@ -89,7 +82,7 @@ class EHRCodesDataset(Dataset):
         Returns:
             dict with keys:
                 - codes: (max_events, num_codes) - discrete code indices
-                - con_time: (max_events, 1) - continuous time
+                - time_ids: (max_events, time_len) - discrete time tokens
                 - demographics: (2,) - age, sex
                 - labels: dict of task labels
                 - mask: (max_events,) - valid event mask
@@ -97,7 +90,7 @@ class EHRCodesDataset(Dataset):
         real_idx = self.indices[idx]
         
         codes = torch.from_numpy(self.codes[real_idx].copy()).long()
-        con_time = torch.from_numpy(self.con_time[real_idx].copy()).float()
+        time_ids = torch.from_numpy(self.time_ids[real_idx].copy()).long()
         
         mask = (codes.sum(dim=-1) > 0).float()
         
@@ -121,7 +114,7 @@ class EHRCodesDataset(Dataset):
         
         return {
             'codes': codes,
-            'con_time': con_time,
+            'time_ids': time_ids,
             'demographics': demographics,
             'labels': labels,
             'mask': mask,
@@ -146,7 +139,7 @@ class EHRCodesCollator:
         
         collated = {
             'codes': torch.stack([b['codes'] for b in batch]),
-            'con_time': torch.stack([b['con_time'] for b in batch]),
+            'time_ids': torch.stack([b['time_ids'] for b in batch]),
             'demographics': torch.stack([b['demographics'] for b in batch]),
             'mask': torch.stack([b['mask'] for b in batch]),
         }
