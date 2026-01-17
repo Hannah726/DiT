@@ -1,6 +1,6 @@
 """
-Dataset for RQ-VAE Codes
-Loads preprocessed codes instead of raw tokens
+Dataset for EHR Diffusion with RQ-VAE Codes
+Loads preprocessed codes and time tokens
 """
 
 import os
@@ -11,17 +11,16 @@ from torch.utils.data import Dataset
 from typing import Dict
 
 
-class EHRCodesDataset(Dataset):
+class EHRDataset(Dataset):
     """
-    Dataset for EHR Diffusion with RQ-VAE codes
+    Dataset for EHR Diffusion with RQ-VAE codes and time conditioning
     
     Args:
         data_dir: Path to processed data directory
         codes_dir: Path to codes directory (contains mimiciv_hi_code.npy)
         split: 'train', 'valid', or 'test'
-        obs_window: Observation window in hours (6, 12, 24)
-        seed: Random seed for split (0, 1, or 2)
-        max_events: Maximum number of events (default: None, auto-detect)
+        obs_window: Observation window in hours (6, 12, or 24)
+        seed: Random seed for data split (0, 1, or 2)
     """
     
     def __init__(
@@ -30,8 +29,7 @@ class EHRCodesDataset(Dataset):
         codes_dir: str,
         split: str = 'train',
         obs_window: int = 12,
-        seed: int = 0,
-        max_events: int = None
+        seed: int = 0
     ):
         super().__init__()
         
@@ -41,13 +39,19 @@ class EHRCodesDataset(Dataset):
         self.obs_window = obs_window
         self.seed = seed
         
-        self.cohort = pd.read_csv(os.path.join(data_dir, 'mimiciv_cohort.csv'))
+        # Load cohort information
+        cohort_file = os.path.join(data_dir, 'mimiciv_cohort.csv')
+        if not os.path.exists(cohort_file):
+            raise FileNotFoundError(f"Cohort file not found: {cohort_file}")
         
+        self.cohort = pd.read_csv(cohort_file)
+        
+        # Get split indices
         split_col = f'split_{seed}'
         if split_col not in self.cohort.columns:
             raise ValueError(
-                f"Split column {split_col} not found. "
-                f"Available: {self.cohort.columns.tolist()}"
+                f"Split column '{split_col}' not found. "
+                f"Available columns: {self.cohort.columns.tolist()}"
             )
         
         self.indices = self.cohort[self.cohort[split_col] == split].index.tolist()
@@ -65,14 +69,38 @@ class EHRCodesDataset(Dataset):
         time_file = os.path.join(data_dir, 'mimiciv_hi_time.npy')
         if not os.path.exists(time_file):
             raise FileNotFoundError(f"Time file not found: {time_file}")
-        self.time_ids = np.load(time_file, mmap_mode='r', allow_pickle=True)
+        self.time_ids = np.load(time_file, mmap_mode='r')
         
-        if max_events is None:
-            self.max_events = self.codes.shape[1]
-        else:
-            self.max_events = max_events
-        
+        # Auto-detect dimensions
+        self.max_events = self.codes.shape[1]
         self.num_codes = self.codes.shape[2] if len(self.codes.shape) > 2 else 8
+        self.time_token_len = self.time_ids.shape[2]  # Auto-detect: 2 for 6/12h, 3 for 24h
+        
+        # Print dataset info
+        print(f"\n{'='*60}")
+        print(f"Dataset: {split.upper()} (obs_window={obs_window}h, seed={seed})")
+        print(f"{'='*60}")
+        print(f"  Num samples: {len(self.indices)}")
+        print(f"  Max events: {self.max_events}")
+        print(f"  Num codes per event: {self.num_codes}")
+        print(f"  Time token length: {self.time_token_len}")
+        print(f"  Codes shape: {self.codes.shape}")
+        print(f"  Time shape: {self.time_ids.shape}")
+        print(f"{'='*60}\n")
+    
+    def get_config_params(self) -> Dict:
+        """
+        Get dataset parameters for model config
+        
+        Returns:
+            dict with auto-detected parameters
+        """
+        return {
+            'max_event_size': self.max_events,
+            'num_codes': self.num_codes,
+            'time_token_len': self.time_token_len,
+            'obs_window': self.obs_window
+        }
     
     def __len__(self) -> int:
         return len(self.indices)
@@ -82,30 +110,35 @@ class EHRCodesDataset(Dataset):
         Returns:
             dict with keys:
                 - codes: (max_events, num_codes) - discrete code indices
-                - time_ids: (max_events, time_len) - discrete time tokens
-                - demographics: (2,) - age, sex
+                - time_ids: (max_events, time_token_len) - discrete time tokens
+                - demographics: (2,) - [age, sex]
                 - labels: dict of task labels
                 - mask: (max_events,) - valid event mask
+                - subject_id: int - patient ID
         """
         real_idx = self.indices[idx]
         
+        # Load codes and time
         codes = torch.from_numpy(self.codes[real_idx].copy()).long()
         time_ids = torch.from_numpy(self.time_ids[real_idx].copy()).long()
         
+        # Create mask: valid if code sum > 0
         mask = (codes.sum(dim=-1) > 0).float()
         
+        # Load demographics
         row = self.cohort.iloc[real_idx]
-        
         demographics = torch.tensor([
-            row['AGE'] / 100.0,
+            row['AGE'] / 100.0,  # Normalize age to [0, 1]
             1.0 if row['GENDER'] == 'M' else 0.0,
         ], dtype=torch.float32)
         
+        # Load labels
         labels = {
             'mortality': torch.tensor(row['mortality'], dtype=torch.long),
             'readmission': torch.tensor(row['readmission'], dtype=torch.long),
         }
         
+        # Handle diagnosis labels (may be missing)
         if pd.notna(row['diagnosis']):
             diagnosis = eval(row['diagnosis']) if isinstance(row['diagnosis'], str) else row['diagnosis']
             labels['diagnosis'] = torch.tensor(diagnosis, dtype=torch.long)
@@ -118,13 +151,13 @@ class EHRCodesDataset(Dataset):
             'demographics': demographics,
             'labels': labels,
             'mask': mask,
-            'subject_id': row['subject_id']
+            'subject_id': int(row['subject_id'])
         }
 
 
-class EHRCodesCollator:
+class EHRCollator:
     """
-    Collate function for codes dataset
+    Collate function for batching
     """
     
     def __call__(self, batch):
@@ -133,10 +166,11 @@ class EHRCodesCollator:
             batch: List of dicts from __getitem__
         
         Returns:
-            Batched dict
+            Batched dict with stacked tensors
         """
         batch_size = len(batch)
         
+        # Stack main tensors
         collated = {
             'codes': torch.stack([b['codes'] for b in batch]),
             'time_ids': torch.stack([b['time_ids'] for b in batch]),
@@ -144,11 +178,13 @@ class EHRCodesCollator:
             'mask': torch.stack([b['mask'] for b in batch]),
         }
         
+        # Stack labels
         collated['labels'] = {
             'mortality': torch.stack([b['labels']['mortality'] for b in batch]),
             'readmission': torch.stack([b['labels']['readmission'] for b in batch]),
         }
         
+        # Handle variable-length diagnosis labels
         max_diag_len = max(len(b['labels']['diagnosis']) for b in batch)
         if max_diag_len > 0:
             diagnosis_batch = torch.zeros(batch_size, max_diag_len, dtype=torch.long)
@@ -158,12 +194,13 @@ class EHRCodesCollator:
                     diagnosis_batch[i, :len(diag)] = diag
             collated['labels']['diagnosis'] = diagnosis_batch
         
+        # Keep subject IDs as list
         collated['subject_ids'] = [b['subject_id'] for b in batch]
         
         return collated
 
 
-def get_codes_dataloader(
+def get_dataloader(
     data_dir: str,
     codes_dir: str,
     split: str,
@@ -175,27 +212,29 @@ def get_codes_dataloader(
     **kwargs
 ):
     """
-    Create DataLoader for codes
+    Create DataLoader for EHR data
     
     Args:
-        data_dir: Path to processed data
+        data_dir: Path to processed data directory
         codes_dir: Path to codes directory
         split: 'train', 'valid', or 'test'
         batch_size: Batch size
-        obs_window: Observation window (6, 12, 24)
-        seed: Random seed
-        num_workers: Number of workers
-        shuffle: Whether to shuffle
+        obs_window: Observation window (6, 12, or 24)
+        seed: Random seed for split
+        num_workers: Number of data loading workers
+        shuffle: Whether to shuffle (default: True for train, False otherwise)
+        **kwargs: Additional arguments for Dataset
     
     Returns:
-        DataLoader
+        dataloader: PyTorch DataLoader
+        dataset: Dataset instance (for accessing auto-detected params)
     """
     from torch.utils.data import DataLoader
     
     if shuffle is None:
         shuffle = (split == 'train')
     
-    dataset = EHRCodesDataset(
+    dataset = EHRDataset(
         data_dir=data_dir,
         codes_dir=codes_dir,
         split=split,
@@ -209,8 +248,10 @@ def get_codes_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        collate_fn=EHRCodesCollator(),
-        pin_memory=True
+        collate_fn=EHRCollator(),
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_workers > 0 else None
     )
     
-    return dataloader
+    return dataloader, dataset

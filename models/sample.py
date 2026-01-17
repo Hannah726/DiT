@@ -1,8 +1,3 @@
-"""
-DDIM Sampling for EHR Diffusion with RQ-VAE Codes
-Generates synthetic codes and optionally decodes to tokens
-"""
-
 import os
 import sys
 import argparse
@@ -12,24 +7,14 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from models.ehr_diffusion_codes import EHRDiffusionCodesModel
+from models.ehr_diffusion import EHRDiffusion
 from models.archive.scheduler import DDIMScheduler
 from utils.rqvae_utils import load_rqvae_decoder, decode_codes_to_tokens
 
 
 class DDIMCodesSampler:
-    """
-    DDIM sampler for code-based diffusion
-    """
     
     def __init__(self, model, scheduler, device='cuda', time_condition=None):
-        """
-        Args:
-            model: EHRDiffusionCodesModel
-            scheduler: DDIMScheduler
-            device: Device to run on
-            time_condition: (B, N, 1) time condition tensor, or None
-        """
         self.model = model
         self.scheduler = scheduler
         self.device = device
@@ -45,20 +30,6 @@ class DDIMCodesSampler:
         batch_size=32,
         eta=0.0
     ):
-        """
-        Sample codes using DDIM
-        
-        Args:
-            num_samples: Number of samples to generate
-            num_events: Number of events per sample
-            time_condition: (num_samples, num_events, 1) time values
-            batch_size: Batch size
-            eta: DDIM eta parameter
-        
-        Returns:
-            codes: (num_samples, num_events, num_codes) generated codes
-            time: (num_samples, num_events, 1) time values used
-        """
         all_codes = []
         all_times = []
         
@@ -105,18 +76,6 @@ class DDIMCodesSampler:
         time_condition,
         eta=0.0
     ):
-        """
-        Sample single batch
-        
-        Args:
-            batch_size: Batch size
-            num_events: Number of events
-            time_condition: (B, N, 1) time values
-            eta: DDIM eta
-        
-        Returns:
-            codes: (B, N, num_codes) sampled codes
-        """
         model = self.model.module if hasattr(self.model, 'module') else self.model
         
         latent_dim = model.latent_dim
@@ -141,10 +100,10 @@ class DDIMCodesSampler:
             t = self.scheduler.timesteps[timestep_idx].item()
             t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
             
-            predicted_noise = model.dit(
-                x=x,
+            predicted_noise = model.denoise(
+                noisy_latent=x,
                 t=t_tensor,
-                time_condition=time_condition,
+                time_ids=time_condition,
                 mask=mask
             )
             
@@ -160,7 +119,6 @@ class DDIMCodesSampler:
         return codes
     
     def _ddim_step(self, predicted_noise, timestep_idx, sample, eta=0.0):
-        """DDIM sampling step"""
         t = self.scheduler.timesteps[timestep_idx].item()
         prev_t = self.scheduler.timesteps[timestep_idx - 1] if timestep_idx > 0 else torch.tensor(-1)
         
@@ -242,18 +200,7 @@ def main():
     config = checkpoint['config']
     
     print("Creating model...")
-    model = EHRDiffusionCodesModel(
-        codebook_size=config.get('codebook_size', 1024),
-        rqvae_dim=config.get('rqvae_dim', 256),
-        latent_dim=config['latent_dim'],
-        num_codes=config.get('num_codes', 8),
-        hidden_dim=config['hidden_dim'],
-        num_layers=config['num_layers'],
-        num_heads=config['num_heads'],
-        dropout=0.0,
-        time_condition_dim=config.get('time_condition_dim', None),
-        use_sinusoidal_time=config.get('use_sinusoidal_time', True)
-    )
+    model = EHRDiffusion(config)
     
     state_dict = checkpoint['model_state_dict']
     if any(key.startswith('_orig_mod.') for key in state_dict.keys()):

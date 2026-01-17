@@ -1,25 +1,9 @@
-"""
-Code Embedder: Discrete codes -> Continuous latent
-Converts RQ-VAE codes (8 discrete indices) to continuous latent vectors
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class CodeEmbedder(nn.Module):
-    """
-    Embeds discrete RQ-VAE codes into continuous latent space
-    
-    Args:
-        codebook_size: Size of RQ-VAE codebook (default: 1024)
-        rqvae_dim: Original RQ-VAE codebook dimension (default: 256)
-        latent_dim: Target latent dimension for diffusion (default: 128)
-        num_codes: Number of codes per event (default: 8)
-        aggregation: How to aggregate codes ('mean', 'sum', 'max')
-        freeze_codebook: Whether to freeze codebook during training
-    """
     
     def __init__(
         self,
@@ -67,12 +51,6 @@ class CodeEmbedder(nn.Module):
                 nn.init.constant_(module.weight, 1.0)
     
     def load_rqvae_codebook(self, rqvae_checkpoint_path):
-        """
-        Load pretrained codebook from RQ-VAE checkpoint
-        
-        Args:
-            rqvae_checkpoint_path: Path to RQ-VAE checkpoint (.pkl file)
-        """
         checkpoint = torch.load(rqvae_checkpoint_path, map_location='cpu')
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         
@@ -119,13 +97,6 @@ class CodeEmbedder(nn.Module):
         print(f"Loaded RQ-VAE codebook: {codebook_weight.shape}")
     
     def forward(self, codes):
-        """
-        Args:
-            codes: (B, N, 8) - discrete code indices from RQ-VAE
-        
-        Returns:
-            (B, N, latent_dim) - continuous latent vectors
-        """
         B, N, num_codes = codes.shape
         
         if num_codes != self.num_codes:

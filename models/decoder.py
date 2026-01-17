@@ -1,24 +1,9 @@
-"""
-Code Decoder: Latent -> Discrete codes
-Predicts RQ-VAE codes from denoised latent vectors
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class CodeDecoder(nn.Module):
-    """
-    Decodes latent vectors back to discrete RQ-VAE codes
-    
-    Args:
-        latent_dim: Input latent dimension (default: 128)
-        hidden_dim: Hidden layer dimension (default: 256)
-        codebook_size: Size of RQ-VAE codebook (default: 1024)
-        num_codes: Number of codes per event (default: 8)
-        dropout: Dropout rate (default: 0.1)
-    """
     
     def __init__(
         self,
@@ -65,17 +50,6 @@ class CodeDecoder(nn.Module):
                 nn.init.constant_(module.weight, 1.0)
     
     def forward(self, latent, return_logits=False):
-        """
-        Args:
-            latent: (B, N, latent_dim) - denoised latent vectors
-            return_logits: Whether to return raw logits or sampled codes
-        
-        Returns:
-            If return_logits=True:
-                (B, N, num_codes, codebook_size) - logits for each code
-            Else:
-                (B, N, num_codes) - predicted discrete codes
-        """
         B, N, _ = latent.shape
         
         h = self.mlp(latent)
@@ -94,18 +68,6 @@ class CodeDecoder(nn.Module):
             return codes
     
     def compute_loss(self, latent, target_codes, mask=None):
-        """
-        Compute cross-entropy loss for code prediction
-        
-        Args:
-            latent: (B, N, latent_dim) - denoised latent
-            target_codes: (B, N, num_codes) - ground truth codes
-            mask: (B, N) - valid event mask
-        
-        Returns:
-            loss: Scalar loss
-            loss_dict: Dictionary of loss components
-        """
         B, N, num_codes = target_codes.shape
         
         logits = self.forward(latent, return_logits=True)
