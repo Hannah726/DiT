@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import math
 
 
 class DiT(nn.Module):
@@ -13,40 +12,30 @@ class DiT(nn.Module):
         self.num_heads = config["num_heads"]
         self.dropout = config["dropout"]
         
-        self.time_condition_dim = config.get("time_condition_dim", self.hidden_dim)
-        self.max_time_vocab = config["max_time_vocab"]
-        self.time_token_len = config["time_token_len"]
-        self.max_event_size = config["max_event_size"]
-        
-        self.time_embedding = nn.Embedding(
-            self.max_time_vocab, 
-            self.time_condition_dim
-        )
-        
-        self.time_position_embedding = nn.Embedding(
-            self.time_token_len,
-            self.time_condition_dim
-        )
+        self.time_dim = config.get("time_dim", 1)
+        self.time_proj_dim = config.get("time_proj_dim", 128)
+        self.time_pad_value = config.get("time_pad_value", -1.0)
         
         self.time_proj = nn.Sequential(
-            nn.Linear(self.time_condition_dim, self.time_condition_dim),
-            nn.LayerNorm(self.time_condition_dim),
-            nn.GELU()
+            nn.Linear(self.time_dim, self.time_proj_dim),
+            nn.LayerNorm(self.time_proj_dim),
+            nn.GELU(),
+            nn.Linear(self.time_proj_dim, self.hidden_dim)
+        )
+        
+        self.gamma_proj = nn.Sequential(
+            nn.Linear(1, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim)
         )
         
         self.input_proj = nn.Linear(self.latent_dim, self.hidden_dim)
-        
-        self.time_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim * 4),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim * 4, self.hidden_dim)
-        )
         
         self.blocks = nn.ModuleList([
             DiTBlock(
                 hidden_dim=self.hidden_dim,
                 num_heads=self.num_heads,
-                condition_dim=self.time_condition_dim,
+                condition_dim=self.hidden_dim,
                 dropout=self.dropout
             )
             for _ in range(self.num_layers)
@@ -61,30 +50,28 @@ class DiT(nn.Module):
             torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, x, t, time_ids, mask=None):
-        B, N, time_len = time_ids.shape
+    def forward(self, x, gamma, time_gaps, mask=None):
+        B, N, _ = x.shape
         
-        time_emb = self.time_embedding(time_ids)
+        time_valid = (time_gaps >= 0).float()
+        time_gaps_clean = time_gaps.clone()
+        time_gaps_clean[time_gaps < 0] = 0.0
         
-        positions = torch.arange(time_len, device=time_ids.device)
-        pos_emb = self.time_position_embedding(positions)
-        time_emb = time_emb + pos_emb.unsqueeze(0).unsqueeze(0)
+        time_condition = self.time_proj(time_gaps_clean)
+        time_condition = time_condition * time_valid
         
-        time_condition = time_emb.mean(dim=2)
-        time_condition = self.time_proj(time_condition)
+        if gamma.dim() == 1:
+            gamma = gamma.unsqueeze(-1)
         
-        t_emb = self.timestep_embedding(t, self.hidden_dim)
-        t_emb = self.time_mlp(t_emb)
-        t_emb = t_emb.unsqueeze(1).expand(-1, N, -1)
+        gamma_emb = self.gamma_proj(gamma)
+        gamma_emb = gamma_emb.unsqueeze(1).expand(-1, N, -1)
         
         h = self.input_proj(x)
-        h = h + t_emb
+        h = h + gamma_emb
         
         for block in self.blocks:
             h = block(h, time_condition, mask)
@@ -92,17 +79,6 @@ class DiT(nn.Module):
         out = self.output_proj(h)
         
         return out
-    
-    def timestep_embedding(self, timesteps, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=timesteps.device)
-        args = timesteps[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
 
 
 class DiTBlock(nn.Module):
@@ -116,7 +92,7 @@ class DiTBlock(nn.Module):
         
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.cross_attn = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True, 
+            hidden_dim, num_heads, dropout=dropout, batch_first=True,
             kdim=condition_dim, vdim=condition_dim
         )
         
@@ -130,7 +106,10 @@ class DiTBlock(nn.Module):
         )
     
     def forward(self, x, time_condition, mask=None):
-        attn_mask = ~mask if mask is not None else None
+        if mask is not None:
+            attn_mask = ~mask.bool()
+        else:
+            attn_mask = None
         
         x = x + self.self_attn(
             self.norm1(x), self.norm1(x), self.norm1(x),

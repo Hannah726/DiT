@@ -1,13 +1,12 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class CodeEmbedder(nn.Module):
     
     def __init__(
         self,
-        codebook_size: int = 1024,
+        codebook_size: int = 1025,
         rqvae_dim: int = 256,
         latent_dim: int = 128,
         num_codes: int = 8,
@@ -74,15 +73,11 @@ class CodeEmbedder(nn.Module):
                 print(f"Trying first match: {available_keys[0]}")
                 codebook_weight = state_dict[available_keys[0]]
             else:
-                raise KeyError(
-                    f"Could not find codebook in checkpoint. "
-                    f"Available keys: {list(state_dict.keys())[:10]}"
-                )
+                raise KeyError(f"Could not find codebook in checkpoint")
         
-        if codebook_weight.shape[0] != self.codebook_size:
+        if codebook_weight.shape[0] != 1024:
             raise ValueError(
-                f"Codebook size mismatch: expected {self.codebook_size}, "
-                f"got {codebook_weight.shape[0]}"
+                f"Codebook size mismatch: expected 1024, got {codebook_weight.shape[0]}"
             )
         
         if codebook_weight.shape[1] != self.rqvae_dim:
@@ -93,16 +88,15 @@ class CodeEmbedder(nn.Module):
             self.rqvae_dim = codebook_weight.shape[1]
             self.codebook = nn.Embedding(self.codebook_size, self.rqvae_dim)
         
-        self.codebook.weight.data.copy_(codebook_weight)
+        self.codebook.weight.data[:1024].copy_(codebook_weight)
         print(f"Loaded RQ-VAE codebook: {codebook_weight.shape}")
+        print(f"Mask token embedding initialized randomly")
     
     def forward(self, codes):
         B, N, num_codes = codes.shape
         
         if num_codes != self.num_codes:
-            raise ValueError(
-                f"Expected {self.num_codes} codes per event, got {num_codes}"
-            )
+            raise ValueError(f"Expected {self.num_codes} codes per event, got {num_codes}")
         
         code_emb = self.codebook(codes)
         

@@ -1,6 +1,6 @@
 """
-Dataset for EHR Diffusion with RQ-VAE Codes
-Loads preprocessed codes and time tokens
+Dataset for MaskDiT with RQ-VAE Codes
+Loads preprocessed codes and continuous time gaps
 """
 
 import os
@@ -13,7 +13,7 @@ from typing import Dict
 
 class EHRDataset(Dataset):
     """
-    Dataset for EHR Diffusion with RQ-VAE codes and time conditioning
+    Dataset for MaskDiT with RQ-VAE codes and continuous time gaps
     
     Args:
         data_dir: Path to processed data directory
@@ -65,16 +65,16 @@ class EHRDataset(Dataset):
             )
         self.codes = np.load(codes_file, mmap_mode='r')
         
-        # Load discrete time tokens
-        time_file = os.path.join(data_dir, 'mimiciv_hi_time.npy')
+        # Load continuous time gaps
+        time_file = os.path.join(data_dir, f'mimiciv_con_time_{obs_window}.npy')
         if not os.path.exists(time_file):
             raise FileNotFoundError(f"Time file not found: {time_file}")
-        self.time_ids = np.load(time_file, mmap_mode='r')
+        self.time_gaps = np.load(time_file, mmap_mode='r')
         
         # Auto-detect dimensions
         self.max_events = self.codes.shape[1]
         self.num_codes = self.codes.shape[2] if len(self.codes.shape) > 2 else 8
-        self.time_token_len = self.time_ids.shape[2]  # Auto-detect: 2 for 6/12h, 3 for 24h
+        self.time_dim = self.time_gaps.shape[2] if len(self.time_gaps.shape) > 2 else 1
         
         # Print dataset info
         print(f"\n{'='*60}")
@@ -83,9 +83,9 @@ class EHRDataset(Dataset):
         print(f"  Num samples: {len(self.indices)}")
         print(f"  Max events: {self.max_events}")
         print(f"  Num codes per event: {self.num_codes}")
-        print(f"  Time token length: {self.time_token_len}")
+        print(f"  Time dimension: {self.time_dim}")
         print(f"  Codes shape: {self.codes.shape}")
-        print(f"  Time shape: {self.time_ids.shape}")
+        print(f"  Time gaps shape: {self.time_gaps.shape}")
         print(f"{'='*60}\n")
     
     def get_config_params(self) -> Dict:
@@ -98,7 +98,7 @@ class EHRDataset(Dataset):
         return {
             'max_event_size': self.max_events,
             'num_codes': self.num_codes,
-            'time_token_len': self.time_token_len,
+            'time_dim': self.time_dim,
             'obs_window': self.obs_window
         }
     
@@ -110,7 +110,7 @@ class EHRDataset(Dataset):
         Returns:
             dict with keys:
                 - codes: (max_events, num_codes) - discrete code indices
-                - time_ids: (max_events, time_token_len) - discrete time tokens
+                - time_gaps: (max_events, time_dim) - continuous time gaps
                 - demographics: (2,) - [age, sex]
                 - labels: dict of task labels
                 - mask: (max_events,) - valid event mask
@@ -120,7 +120,7 @@ class EHRDataset(Dataset):
         
         # Load codes and time
         codes = torch.from_numpy(self.codes[real_idx].copy()).long()
-        time_ids = torch.from_numpy(self.time_ids[real_idx].copy()).long()
+        time_gaps = torch.from_numpy(self.time_gaps[real_idx].copy()).float()
         
         # Create mask: valid if code sum > 0
         mask = (codes.sum(dim=-1) > 0).float()
@@ -147,7 +147,7 @@ class EHRDataset(Dataset):
         
         return {
             'codes': codes,
-            'time_ids': time_ids,
+            'time_gaps': time_gaps,
             'demographics': demographics,
             'labels': labels,
             'mask': mask,
@@ -173,7 +173,7 @@ class EHRCollator:
         # Stack main tensors
         collated = {
             'codes': torch.stack([b['codes'] for b in batch]),
-            'time_ids': torch.stack([b['time_ids'] for b in batch]),
+            'time_gaps': torch.stack([b['time_gaps'] for b in batch]),
             'demographics': torch.stack([b['demographics'] for b in batch]),
             'mask': torch.stack([b['mask'] for b in batch]),
         }

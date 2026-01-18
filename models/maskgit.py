@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
-from typing import Optional, Dict
+from typing import Optional, Tuple
 
 from models.embedder import CodeEmbedder
 from models.decoder import CodeDecoder
 from models.dit import DiT
+from models.mask_schedule import random_mask
 
 
 class EHRDiffusion(nn.Module):
@@ -14,11 +15,12 @@ class EHRDiffusion(nn.Module):
         
         self.config = config
         self.codebook_size = config["codebook_size"]
+        self.mask_token_id = config["mask_token_id"]
         self.latent_dim = config["latent_dim"]
         self.num_codes = config["num_codes"]
         
         self.code_embedder = CodeEmbedder(
-            codebook_size=config["codebook_size"],
+            codebook_size=config["codebook_size"] + 1,
             rqvae_dim=config["rqvae_dim"],
             latent_dim=config["latent_dim"],
             num_codes=config["num_codes"],
@@ -27,6 +29,7 @@ class EHRDiffusion(nn.Module):
         )
         
         self.dit = DiT(config)
+        
         self.code_decoder = CodeDecoder(
             latent_dim=config["latent_dim"],
             hidden_dim=config["hidden_dim"],
@@ -44,19 +47,25 @@ class EHRDiffusion(nn.Module):
     def decode(self, code_latent, return_logits=False):
         return self.code_decoder(code_latent, return_logits=return_logits)
     
-    def denoise(self, noisy_latent, t, time_ids, mask=None):
-        return self.dit(noisy_latent, t, time_ids, mask)
+    def forward_with_mask(
+        self,
+        codes: torch.Tensor,
+        time_gaps: torch.Tensor,
+        mask_ratio: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        masked_codes, masked_positions = random_mask(
+            codes, mask_ratio, self.mask_token_id, valid_mask
+        )
+        
+        latent = self.encode(masked_codes)
+        latent = self.dit(latent, mask_ratio, time_gaps, valid_mask)
+        logits = self.decode(latent, return_logits=True)
+        
+        return logits, masked_positions
     
-    def training_step(self, codes, time_ids, mask=None):
-        code_latent = self.encode(codes)
-        code_logits = self.decode(code_latent, return_logits=True)
-        predicted_codes = code_logits.argmax(dim=-1)
-        return {
-            'code_latent': code_latent,
-            'predicted_codes': predicted_codes,
-            'code_logits': code_logits
-        }
-    
-    def forward(self, codes, time_ids=None, mask=None):
-        output = self.training_step(codes, time_ids, mask)
-        return output['predicted_codes']
+    def forward(self, codes, time_gaps, gamma, mask=None):
+        latent = self.encode(codes)
+        latent = self.dit(latent, gamma, time_gaps, mask)
+        logits = self.decode(latent, return_logits=True)
+        return logits
