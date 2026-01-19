@@ -35,11 +35,21 @@ class DiT(nn.Module):
             DiTBlock(
                 hidden_dim=self.hidden_dim,
                 num_heads=self.num_heads,
-                condition_dim=self.hidden_dim,
                 dropout=self.dropout
             )
             for _ in range(self.num_layers)
         ])
+        
+        # Original version with cross-attention:
+        # self.blocks = nn.ModuleList([
+        #     DiTBlock(
+        #         hidden_dim=self.hidden_dim,
+        #         num_heads=self.num_heads,
+        #         condition_dim=self.hidden_dim,
+        #         dropout=self.dropout
+        #     )
+        #     for _ in range(self.num_layers)
+        # ])
         
         self.output_proj = nn.Linear(self.hidden_dim, self.latent_dim)
         
@@ -71,10 +81,14 @@ class DiT(nn.Module):
         gamma_emb = gamma_emb.unsqueeze(1).expand(-1, N, -1)
         
         h = self.input_proj(x)
-        h = h + gamma_emb
+        h = h + gamma_emb + time_condition
         
         for block in self.blocks:
-            h = block(h, time_condition, mask)
+            h = block(h, mask)
+        
+        # Original version with cross-attention:
+        # for block in self.blocks:
+        #     h = block(h, time_condition, mask)
         
         out = self.output_proj(h)
         
@@ -82,7 +96,7 @@ class DiT(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, hidden_dim, num_heads, condition_dim, dropout=0.1):
+    def __init__(self, hidden_dim, num_heads, dropout=0.1):
         super().__init__()
         
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -91,12 +105,6 @@ class DiTBlock(nn.Module):
         )
         
         self.norm2 = nn.LayerNorm(hidden_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True,
-            kdim=condition_dim, vdim=condition_dim
-        )
-        
-        self.norm3 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
@@ -104,8 +112,17 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.Dropout(dropout)
         )
+        
+        # Original version with cross-attention:
+        # def __init__(self, hidden_dim, num_heads, condition_dim, dropout=0.1):
+        #     ...
+        #     self.cross_attn = nn.MultiheadAttention(
+        #         hidden_dim, num_heads, dropout=dropout, batch_first=True,
+        #         kdim=condition_dim, vdim=condition_dim
+        #     )
+        #     self.norm3 = nn.LayerNorm(hidden_dim)
     
-    def forward(self, x, time_condition, mask=None):
+    def forward(self, x, mask=None):
         if mask is not None:
             attn_mask = ~mask.bool()
         else:
@@ -116,11 +133,15 @@ class DiTBlock(nn.Module):
             key_padding_mask=attn_mask
         )[0]
         
-        x = x + self.cross_attn(
-            self.norm2(x), time_condition, time_condition,
-            key_padding_mask=attn_mask
-        )[0]
+        x = x + self.mlp(self.norm2(x))
         
-        x = x + self.mlp(self.norm3(x))
+        # Original version with cross-attention:
+        # def forward(self, x, time_condition, mask=None):
+        #     ...
+        #     x = x + self.cross_attn(
+        #         self.norm2(x), time_condition, time_condition,
+        #         key_padding_mask=attn_mask
+        #     )[0]
+        #     x = x + self.mlp(self.norm3(x))
         
         return x

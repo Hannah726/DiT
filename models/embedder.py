@@ -6,11 +6,11 @@ class CodeEmbedder(nn.Module):
     
     def __init__(
         self,
-        codebook_size: int = 1025,
+        codebook_size: int = 1026,
         rqvae_dim: int = 256,
         latent_dim: int = 128,
         num_codes: int = 8,
-        aggregation: str = 'mean',
+        aggregation: str = 'sum',
         freeze_codebook: bool = False
     ):
         super().__init__()
@@ -20,11 +20,12 @@ class CodeEmbedder(nn.Module):
         self.latent_dim = latent_dim
         self.num_codes = num_codes
         self.aggregation = aggregation
+        self.freeze_codebook = freeze_codebook
         
+        # Use single embedding for both RQ-VAE codes and mask token
         self.codebook = nn.Embedding(codebook_size, rqvae_dim)
         
-        if freeze_codebook:
-            self.codebook.weight.requires_grad = False
+        # Don't freeze here - will handle in load_rqvae_codebook
         
         if rqvae_dim != latent_dim:
             self.proj = nn.Sequential(
@@ -54,26 +55,29 @@ class CodeEmbedder(nn.Module):
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         
         codebook_keys = [
+            'quantize_model.layers.0._codebook.embed',
+            'quantize_model.layers.1._codebook.embed',
             'module.quantizer.embedding.weight',
             'quantizer.embedding.weight',
-            'rq_vae.quantizer.embedding.weight',
-            'embedding.weight'
         ]
         
         codebook_weight = None
         for key in codebook_keys:
             if key in state_dict:
                 codebook_weight = state_dict[key]
+                print(f"Found codebook at: {key}")
                 break
         
         if codebook_weight is None:
-            available_keys = [k for k in state_dict.keys() if 'embedding' in k.lower()]
-            if available_keys:
-                print(f"Available embedding keys: {available_keys}")
-                print(f"Trying first match: {available_keys[0]}")
-                codebook_weight = state_dict[available_keys[0]]
-            else:
-                raise KeyError(f"Could not find codebook in checkpoint")
+            available_keys = [k for k in state_dict.keys() if 'codebook' in k.lower() or 'embed' in k.lower()]
+            raise KeyError(
+                f"Could not find codebook in checkpoint. "
+                f"Available keys: {available_keys[:5]}"
+            )
+        
+        # Reshape if needed: [1, 1024, 256] -> [1024, 256]
+        if len(codebook_weight.shape) == 3:
+            codebook_weight = codebook_weight.squeeze(0)
         
         if codebook_weight.shape[0] != 1024:
             raise ValueError(
@@ -88,9 +92,20 @@ class CodeEmbedder(nn.Module):
             self.rqvae_dim = codebook_weight.shape[1]
             self.codebook = nn.Embedding(self.codebook_size, self.rqvae_dim)
         
+        # Load only 0-1023 from RQ-VAE
         self.codebook.weight.data[:1024].copy_(codebook_weight)
         print(f"Loaded RQ-VAE codebook: {codebook_weight.shape}")
-        print(f"Mask token embedding initialized randomly")
+        print(f"Embeddings 1024 (padding) and 1025 (mask) initialized randomly")
+        
+        # Freeze only RQ-VAE codes (0-1023), keep 1024 (padding) and 1025 (mask) trainable
+        if self.freeze_codebook:
+            def freeze_rqvae_only(grad):
+                grad[:1024] = 0
+                return grad
+            self.codebook.weight.register_hook(freeze_rqvae_only)
+            print("Frozen RQ-VAE codes (0-1023), embeddings 1024-1025 trainable")
+        else:
+            print("All embeddings trainable")
     
     def forward(self, codes):
         B, N, num_codes = codes.shape
@@ -98,8 +113,10 @@ class CodeEmbedder(nn.Module):
         if num_codes != self.num_codes:
             raise ValueError(f"Expected {self.num_codes} codes per event, got {num_codes}")
         
-        code_emb = self.codebook(codes)
+        # Direct embedding lookup (handles mask token automatically)
+        code_emb = self.codebook(codes)  # (B, N, num_codes, rqvae_dim)
         
+        # Aggregate across num_codes dimension
         if self.aggregation == 'mean':
             code_agg = code_emb.mean(dim=2)
         elif self.aggregation == 'sum':
@@ -109,6 +126,7 @@ class CodeEmbedder(nn.Module):
         else:
             raise ValueError(f"Unknown aggregation: {self.aggregation}")
         
+        # Project if needed
         if self.proj is not None:
             code_agg = self.proj(code_agg)
         

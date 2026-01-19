@@ -14,13 +14,6 @@ from typing import Dict
 class EHRDataset(Dataset):
     """
     Dataset for MaskDiT with RQ-VAE codes and continuous time gaps
-    
-    Args:
-        data_dir: Path to processed data directory
-        codes_dir: Path to codes directory (contains mimiciv_hi_code.npy)
-        split: 'train', 'valid', or 'test'
-        obs_window: Observation window in hours (6, 12, or 24)
-        seed: Random seed for data split (0, 1, or 2)
     """
     
     def __init__(
@@ -122,8 +115,8 @@ class EHRDataset(Dataset):
         codes = torch.from_numpy(self.codes[real_idx].copy()).long()
         time_gaps = torch.from_numpy(self.time_gaps[real_idx].copy()).float()
         
-        # Create mask: valid if code sum > 0
-        mask = (codes.sum(dim=-1) > 0).float()
+        # Create mask: valid if time_gaps >= 0 (padding is -1.0)
+        mask = (time_gaps.squeeze(-1) >= 0).float()
         
         # Load demographics
         row = self.cohort.iloc[real_idx]

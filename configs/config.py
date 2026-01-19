@@ -13,8 +13,8 @@ def get_config(obs_window=12, seed=0):
         'max_event_size': max_events[obs_window],
         'num_codes': 8,
         
-        'codebook_size': 1024,
-        'mask_token_id': 1024,
+        'codebook_size': 1025,
+        'mask_token_id': 1025,
         'mask_schedule': 'cosine',
         'mask_ratio_min': 0.05,
         'mask_ratio_max': 0.95,
@@ -29,7 +29,7 @@ def get_config(obs_window=12, seed=0):
         'num_layers': 8,
         'num_heads': 8,
         'dropout': 0.1,
-        'code_aggregation': 'mean',
+        'code_aggregation': 'sum',
         'freeze_codebook': True,
         
         'batch_size': 64,

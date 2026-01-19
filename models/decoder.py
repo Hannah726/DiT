@@ -9,7 +9,7 @@ class CodeDecoder(nn.Module):
         self,
         latent_dim: int = 128,
         hidden_dim: int = 256,
-        codebook_size: int = 1024,
+        codebook_size: int = 1025,
         num_codes: int = 8,
         dropout: float = 0.1
     ):
