@@ -10,6 +10,9 @@ from configs.config import get_config, get_quick_test_config
 from models.dataset import get_dataloader
 from models.maskgit import EHRDiffusion
 from models.trainer import EHRTrainer
+from torch.utils.data import DataLoader
+from models.dataset import EHRCollator
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -21,13 +24,15 @@ def parse_args():
     parser.add_argument('--data_dir', type=str, default=None)
     parser.add_argument('--codes_dir', type=str, default=None)
     parser.add_argument('--rqvae_checkpoint', type=str, default=None)
+    
+    parser.add_argument('--checkpoint_dir', type=str, default=None)
+    
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
-    parser.add_argument('--checkpoint_dir', type=str, default=None)
-    parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--data_fraction', type=float, default=None)
     
+    parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--use_wandb', action='store_true')
     
@@ -92,18 +97,25 @@ def main():
         config['codes_dir'] = args.codes_dir
     if args.rqvae_checkpoint is not None:
         config['rqvae_checkpoint'] = args.rqvae_checkpoint
+    elif args.codes_dir is not None:
+        default_rqvae_path = os.path.join(args.codes_dir, 'train_RQVAE_indep.pkl')
+        if os.path.exists(default_rqvae_path):
+            config['rqvae_checkpoint'] = default_rqvae_path
+    
+    if args.checkpoint_dir is not None:
+        config['checkpoint_dir'] = args.checkpoint_dir
+    
     if args.batch_size is not None:
         config['batch_size'] = args.batch_size
     if args.epochs is not None:
         config['epochs'] = args.epochs
     if args.lr is not None:
         config['lr'] = args.lr
-    if args.checkpoint_dir is not None:
-        config['checkpoint_dir'] = args.checkpoint_dir
-    if args.run_name is not None:
-        config['run_name'] = args.run_name
     if args.data_fraction is not None:
         config['data_fraction'] = args.data_fraction
+    
+    if args.run_name is not None:
+        config['run_name'] = args.run_name
     if args.use_wandb:
         config['use_wandb'] = True
     
@@ -163,8 +175,24 @@ def main():
         train_indices = random.sample(range(original_train_size), train_size)
         val_indices = list(range(val_size))
         
-        train_loader.dataset = Subset(train_loader.dataset, train_indices)
-        val_loader.dataset = Subset(val_loader.dataset, val_indices)
+        train_subset = Subset(train_loader.dataset, train_indices)
+        val_subset = Subset(val_loader.dataset, val_indices)
+
+        train_loader = DataLoader(
+            train_subset, batch_size=config['batch_size'], shuffle=True,
+            num_workers=config['num_workers'], collate_fn=EHRCollator(),
+            pin_memory=True, 
+            persistent_workers=True if config['num_workers'] > 0 else False,
+            prefetch_factor=4 if config['num_workers'] > 0 else None
+        )
+
+        val_loader = DataLoader(
+            val_subset, batch_size=config['batch_size'], shuffle=False,
+            num_workers=config['num_workers'], collate_fn=EHRCollator(),
+            pin_memory=True,
+            persistent_workers=True if config['num_workers'] > 0 else False,
+            prefetch_factor=4 if config['num_workers'] > 0 else None
+        )
         
         print(f"Using {fraction*100:.1f}% of data:")
         print(f"  Train: {train_size}/{original_train_size}")

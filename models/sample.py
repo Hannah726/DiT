@@ -1,8 +1,11 @@
 import os
+import sys
 import argparse
 import torch
 import numpy as np
 from tqdm import tqdm
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from models.maskgit import EHRDiffusion
 from models.mask_schedule import cosine_schedule, unmask_by_confidence
@@ -49,7 +52,10 @@ class MaskGITSampler:
             all_codes.append(batch_codes.cpu().numpy())
             
             if batch_time_gaps is not None:
-                all_times.append(batch_time_gaps.cpu().numpy())
+                if isinstance(batch_time_gaps, np.ndarray):
+                    all_times.append(batch_time_gaps)
+                else:
+                    all_times.append(batch_time_gaps.cpu().numpy())
         
         all_codes = np.concatenate(all_codes, axis=0)
         
@@ -63,48 +69,69 @@ class MaskGITSampler:
     @torch.no_grad()
     def _sample_batch(self, batch_size, num_events, time_gaps):
         model = self.model.module if hasattr(self.model, 'module') else self.model
-        
         num_codes = self.config['num_codes']
+
         codes = torch.full(
             (batch_size, num_events, num_codes),
             self.mask_token_id,
             device=self.device,
             dtype=torch.long
         )
-        
+
         if time_gaps is not None:
             if isinstance(time_gaps, np.ndarray):
                 time_gaps = torch.from_numpy(time_gaps).float().to(self.device)
             mask = (time_gaps.squeeze(-1) >= 0).float()
         else:
-            time_gaps = torch.zeros(batch_size, num_events, 1, device=self.device)
+            time_gaps = torch.full(
+                (batch_size, num_events, 1),
+                -1.0,
+                device=self.device
+            )
             mask = torch.ones(batch_size, num_events, device=self.device)
-        
+
+        # Record total masked positions (within valid regions)
+        total_masked = ((codes == self.mask_token_id) & mask.bool().unsqueeze(-1)).sum().item()
+
         for step in range(self.num_iterations):
+            # Current iteration's mask ratio (decreasing from high to low)
             gamma = cosine_schedule(
                 step, self.num_iterations,
                 self.config['mask_ratio_min'],
                 self.config['mask_ratio_max']
             )
             gamma_tensor = torch.full((batch_size,), gamma, device=self.device)
-            
+
             logits = model(codes, time_gaps, gamma_tensor, mask)
-            
+
             if self.temperature != 1.0:
                 logits = logits / self.temperature
-            
+
+            # Count current masked tokens
             num_masked = (codes == self.mask_token_id).sum().item()
-            
+
             if num_masked == 0:
                 break
-            
+
+            # Key fix: compute unmask count based on schedule
             if step < self.num_iterations - 1:
-                num_unmask = int(num_masked * (1.0 / (self.num_iterations - step)))
+                # Next step's gamma
+                next_gamma = cosine_schedule(
+                    step + 1, self.num_iterations,
+                    self.config['mask_ratio_min'],
+                    self.config['mask_ratio_max']
+                )
+                # From current gamma to next gamma, compute how many to unmask
+                # gamma represents "ratio that should remain masked"
+                # so unmask count = total * (current_gamma - next_gamma)
+                num_unmask = int(total_masked * (gamma - next_gamma))
+                num_unmask = max(1, num_unmask)  # unmask at least 1
             else:
+                # Last step: unmask all remaining
                 num_unmask = num_masked
-            
+
             codes = unmask_by_confidence(codes, logits, num_unmask, self.mask_token_id)
-        
+
         return codes
 
 

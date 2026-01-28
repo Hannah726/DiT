@@ -24,6 +24,8 @@ logs/
 *.log.*
 *.out
 *.err
+*.o*
+*.e*
 
 checkpoints/
 checkpoint/

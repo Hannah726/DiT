@@ -20,7 +20,8 @@ class EHRDiffusion(nn.Module):
         self.num_codes = config["num_codes"]
         
         self.code_embedder = CodeEmbedder(
-            codebook_size=config["codebook_size"] + 1,
+            vocab_size=config["vocab_size"],  # 1026
+            codebook_size=config["codebook_size"],  # 1024
             rqvae_dim=config["rqvae_dim"],
             latent_dim=config["latent_dim"],
             num_codes=config["num_codes"],
@@ -33,10 +34,11 @@ class EHRDiffusion(nn.Module):
         self.code_decoder = CodeDecoder(
             latent_dim=config["latent_dim"],
             hidden_dim=config["hidden_dim"],
-            codebook_size=config["codebook_size"],
+            codebook_size=config["codebook_size"],  # 1024
             num_codes=config["num_codes"],
             dropout=config["dropout"]
         )
+
     
     def load_rqvae_codebook(self, rqvae_checkpoint_path):
         self.code_embedder.load_rqvae_codebook(rqvae_checkpoint_path)

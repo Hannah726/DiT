@@ -4,17 +4,20 @@ def get_config(obs_window=12, seed=0):
     return {
         'data_dir': f'data/processed_{obs_window}',
         'codes_dir': f'data/processed_{obs_window}',
-        'time_file': f'mimiciv_con_time_{obs_window}.npy',
+        'time_file': f'mimiciv_num_time_{obs_window}.npy',
         'rqvae_checkpoint': f'data/codebook/{obs_window}/train_RQVAE_indep.pkl',
-        'checkpoint_dir': f'checkpoints/maskdit_{obs_window}h_seed{seed}',
+        'checkpoint_dir': f'outputs/checkpoints/maskdit_{obs_window}h_seed{seed}',
         
         'obs_window': obs_window,
         'seed': seed,
         'max_event_size': max_events[obs_window],
+
         'num_codes': 8,
-        
-        'codebook_size': 1025,
-        'mask_token_id': 1025,
+        'codebook_size': 1024,  # size of rqvae codebook
+        'padding_token_id': 1024,  # padding token
+        'mask_token_id': 1025,  # mask token
+        'vocab_size': 1026,
+
         'mask_schedule': 'cosine',
         'mask_ratio_min': 0.05,
         'mask_ratio_max': 0.95,
@@ -46,7 +49,7 @@ def get_config(obs_window=12, seed=0):
         
         'log_interval': 100,
         'val_interval': 1,
-        'save_interval': 5,
+        'save_interval': 10,
         'early_stopping_patience': 10,
         'project_name': 'MaskDiT-EHR',
         'run_name': f'maskdit_{obs_window}h_seed{seed}',

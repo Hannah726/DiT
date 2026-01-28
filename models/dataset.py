@@ -4,6 +4,7 @@ Loads preprocessed codes and continuous time gaps
 """
 
 import os
+import ast
 import numpy as np
 import pandas as pd
 import torch
@@ -133,7 +134,7 @@ class EHRDataset(Dataset):
         
         # Handle diagnosis labels (may be missing)
         if pd.notna(row['diagnosis']):
-            diagnosis = eval(row['diagnosis']) if isinstance(row['diagnosis'], str) else row['diagnosis']
+            diagnosis = ast.literal_eval(row['diagnosis']) if isinstance(row['diagnosis'], str) else row['diagnosis']
             labels['diagnosis'] = torch.tensor(diagnosis, dtype=torch.long)
         else:
             labels['diagnosis'] = torch.tensor([], dtype=torch.long)

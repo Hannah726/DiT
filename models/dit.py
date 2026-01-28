@@ -40,17 +40,6 @@ class DiT(nn.Module):
             for _ in range(self.num_layers)
         ])
         
-        # Original version with cross-attention:
-        # self.blocks = nn.ModuleList([
-        #     DiTBlock(
-        #         hidden_dim=self.hidden_dim,
-        #         num_heads=self.num_heads,
-        #         condition_dim=self.hidden_dim,
-        #         dropout=self.dropout
-        #     )
-        #     for _ in range(self.num_layers)
-        # ])
-        
         self.output_proj = nn.Linear(self.hidden_dim, self.latent_dim)
         
         self.apply(self._init_weights)
@@ -67,12 +56,15 @@ class DiT(nn.Module):
     def forward(self, x, gamma, time_gaps, mask=None):
         B, N, _ = x.shape
         
-        time_valid = (time_gaps >= 0).float()
         time_gaps_clean = time_gaps.clone()
-        time_gaps_clean[time_gaps < 0] = 0.0
+
+        if mask is not None:
+            time_gaps_clean[~mask.bool().unsqueeze(-1).expand_as(time_gaps)] = -1.0
         
         time_condition = self.time_proj(time_gaps_clean)
-        time_condition = time_condition * time_valid
+
+        if mask is not None:
+            time_condition = time_condition * mask.unsqueeze(-1)
         
         if gamma.dim() == 1:
             gamma = gamma.unsqueeze(-1)
@@ -85,10 +77,6 @@ class DiT(nn.Module):
         
         for block in self.blocks:
             h = block(h, mask)
-        
-        # Original version with cross-attention:
-        # for block in self.blocks:
-        #     h = block(h, time_condition, mask)
         
         out = self.output_proj(h)
         
@@ -112,16 +100,8 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.Dropout(dropout)
         )
-        
-        # Original version with cross-attention:
-        # def __init__(self, hidden_dim, num_heads, condition_dim, dropout=0.1):
-        #     ...
-        #     self.cross_attn = nn.MultiheadAttention(
-        #         hidden_dim, num_heads, dropout=dropout, batch_first=True,
-        #         kdim=condition_dim, vdim=condition_dim
-        #     )
-        #     self.norm3 = nn.LayerNorm(hidden_dim)
-    
+
+
     def forward(self, x, mask=None):
         if mask is not None:
             attn_mask = ~mask.bool()
@@ -134,14 +114,5 @@ class DiTBlock(nn.Module):
         )[0]
         
         x = x + self.mlp(self.norm2(x))
-        
-        # Original version with cross-attention:
-        # def forward(self, x, time_condition, mask=None):
-        #     ...
-        #     x = x + self.cross_attn(
-        #         self.norm2(x), time_condition, time_condition,
-        #         key_padding_mask=attn_mask
-        #     )[0]
-        #     x = x + self.mlp(self.norm3(x))
-        
+
         return x

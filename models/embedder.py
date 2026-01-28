@@ -6,7 +6,8 @@ class CodeEmbedder(nn.Module):
     
     def __init__(
         self,
-        codebook_size: int = 1026,
+        vocab_size: int = 1026,
+        codebook_size: int = 1024,
         rqvae_dim: int = 256,
         latent_dim: int = 128,
         num_codes: int = 8,
@@ -15,6 +16,7 @@ class CodeEmbedder(nn.Module):
     ):
         super().__init__()
         
+        self.vocab_size = vocab_size
         self.codebook_size = codebook_size
         self.rqvae_dim = rqvae_dim
         self.latent_dim = latent_dim
@@ -23,7 +25,7 @@ class CodeEmbedder(nn.Module):
         self.freeze_codebook = freeze_codebook
         
         # Use single embedding for both RQ-VAE codes and mask token
-        self.codebook = nn.Embedding(codebook_size, rqvae_dim)
+        self.codebook = nn.Embedding(vocab_size, rqvae_dim)
         
         # Don't freeze here - will handle in load_rqvae_codebook
         
@@ -79,7 +81,7 @@ class CodeEmbedder(nn.Module):
         if len(codebook_weight.shape) == 3:
             codebook_weight = codebook_weight.squeeze(0)
         
-        if codebook_weight.shape[0] != 1024:
+        if codebook_weight.shape[0] != self.codebook_size:
             raise ValueError(
                 f"Codebook size mismatch: expected 1024, got {codebook_weight.shape[0]}"
             )
@@ -90,20 +92,20 @@ class CodeEmbedder(nn.Module):
                 f"got {codebook_weight.shape[1]}. Using checkpoint dim."
             )
             self.rqvae_dim = codebook_weight.shape[1]
-            self.codebook = nn.Embedding(self.codebook_size, self.rqvae_dim)
+            self.codebook = nn.Embedding(self.vocab_size, self.rqvae_dim)
         
         # Load only 0-1023 from RQ-VAE
-        self.codebook.weight.data[:1024].copy_(codebook_weight)
+        self.codebook.weight.data[:self.codebook_size].copy_(codebook_weight)
         print(f"Loaded RQ-VAE codebook: {codebook_weight.shape}")
-        print(f"Embeddings 1024 (padding) and 1025 (mask) initialized randomly")
+        print(f"Embeddings {self.codebook_size} (padding) and {self.codebook_size+1} (mask) initialized randomly")
         
-        # Freeze only RQ-VAE codes (0-1023), keep 1024 (padding) and 1025 (mask) trainable
+        
         if self.freeze_codebook:
             def freeze_rqvae_only(grad):
                 grad[:1024] = 0
                 return grad
             self.codebook.weight.register_hook(freeze_rqvae_only)
-            print("Frozen RQ-VAE codes (0-1023), embeddings 1024-1025 trainable")
+            print(f"Frozen RQ-VAE codes (0-{self.codebook_size-1}), embeddings {self.codebook_size}-{self.codebook_size+1} trainable")
         else:
             print("All embeddings trainable")
     
