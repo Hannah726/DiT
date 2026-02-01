@@ -13,7 +13,7 @@ def linear_schedule(step, total_steps, min_ratio=0.05, max_ratio=0.95):
     return max_ratio - (max_ratio - min_ratio) * progress
 
 
-def random_mask(codes, mask_ratio, mask_token_id=1025, valid_mask=None):
+def random_mask(codes, mask_ratio, mask_token_id=1024, valid_mask=None):
     B, N, C = codes.shape
     device = codes.device
     

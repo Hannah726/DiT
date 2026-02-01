@@ -60,7 +60,7 @@ class EHRDataset(Dataset):
         self.codes = np.load(codes_file, mmap_mode='r')
         
         # Load continuous time gaps
-        time_file = os.path.join(data_dir, f'mimiciv_num_time_{obs_window}.npy')
+        time_file = os.path.join(data_dir, f'mimiciv_pad_time.npy')
         if not os.path.exists(time_file):
             raise FileNotFoundError(f"Time file not found: {time_file}")
         self.time_gaps = np.load(time_file, mmap_mode='r')
@@ -105,7 +105,6 @@ class EHRDataset(Dataset):
             dict with keys:
                 - codes: (max_events, num_codes) - discrete code indices
                 - time_gaps: (max_events, time_dim) - continuous time gaps
-                - demographics: (2,) - [age, sex]
                 - labels: dict of task labels
                 - mask: (max_events,) - valid event mask
                 - subject_id: int - patient ID
@@ -119,13 +118,8 @@ class EHRDataset(Dataset):
         # Create mask: valid if time_gaps >= 0 (padding is -1.0)
         mask = (time_gaps.squeeze(-1) >= 0).float()
         
-        # Load demographics
         row = self.cohort.iloc[real_idx]
-        demographics = torch.tensor([
-            row['AGE'] / 100.0,  # Normalize age to [0, 1]
-            1.0 if row['GENDER'] == 'M' else 0.0,
-        ], dtype=torch.float32)
-        
+
         # Load labels
         labels = {
             'mortality': torch.tensor(row['mortality'], dtype=torch.long),
@@ -142,7 +136,6 @@ class EHRDataset(Dataset):
         return {
             'codes': codes,
             'time_gaps': time_gaps,
-            'demographics': demographics,
             'labels': labels,
             'mask': mask,
             'subject_id': int(row['subject_id'])
@@ -168,7 +161,6 @@ class EHRCollator:
         collated = {
             'codes': torch.stack([b['codes'] for b in batch]),
             'time_gaps': torch.stack([b['time_gaps'] for b in batch]),
-            'demographics': torch.stack([b['demographics'] for b in batch]),
             'mask': torch.stack([b['mask'] for b in batch]),
         }
         

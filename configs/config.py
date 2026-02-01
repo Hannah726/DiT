@@ -4,7 +4,7 @@ def get_config(obs_window=12, seed=0):
     return {
         'data_dir': f'data/processed_{obs_window}',
         'codes_dir': f'data/processed_{obs_window}',
-        'time_file': f'mimiciv_pad_time}.npy',
+        'time_file': f'mimiciv_pad_time.npy',
         'rqvae_checkpoint': f'data/codebook/{obs_window}/train_RQVAE_indep.pkl',
         'checkpoint_dir': f'outputs/checkpoints/maskdit_{obs_window}h_seed{seed}',
         
@@ -14,7 +14,7 @@ def get_config(obs_window=12, seed=0):
 
         'num_codes': 8,
         'codebook_size': 1024,  # size of rqvae codebook
-        'mask_token_id': 1025,  # mask token
+        'mask_token_id': 1024,  # mask token
         'vocab_size': 1025,
 
         'mask_schedule': 'cosine',

@@ -97,7 +97,7 @@ class CodeEmbedder(nn.Module):
         # Load only 0-1023 from RQ-VAE
         self.codebook.weight.data[:self.codebook_size].copy_(codebook_weight)
         print(f"Loaded RQ-VAE codebook: {codebook_weight.shape}")
-        print(f"Embeddings {self.codebook_size} (padding) and {self.codebook_size+1} (mask) initialized randomly")
+        print(f"Embedding {self.codebook_size} (mask token) initialized randomly")
         
         
         if self.freeze_codebook:

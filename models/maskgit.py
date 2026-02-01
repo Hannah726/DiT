@@ -20,8 +20,8 @@ class EHRDiffusion(nn.Module):
         self.num_codes = config["num_codes"]
         
         self.code_embedder = CodeEmbedder(
-            vocab_size=config["vocab_size"],  # 1026
-            codebook_size=config["codebook_size"],  # 1024
+            vocab_size=config["vocab_size"],
+            codebook_size=config["codebook_size"],
             rqvae_dim=config["rqvae_dim"],
             latent_dim=config["latent_dim"],
             num_codes=config["num_codes"],
