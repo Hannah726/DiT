@@ -85,7 +85,7 @@ class EHRTrainer:
             
             if (epoch + 1) % self.config['val_interval'] == 0:
                 # Run comprehensive validation every 5 epochs
-                comprehensive = ((epoch + 1) % 5 == 0)
+                comprehensive = ((epoch + 1) % self.config.get('comprehensive_val_interval', 10) == 0)
                 val_metrics = self.validate(comprehensive=comprehensive)
 
                 if val_metrics['val_loss'] < self.best_val_loss:
@@ -238,6 +238,7 @@ class EHRTrainer:
         else:
             return self._validate_single_ratio(mask_ratio=0.5)
 
+    @torch.no_grad()
     def _validate_single_ratio(self, mask_ratio: float = 0.5) -> Dict[str, float]:
         """Fast validation with single fixed mask ratio"""
         metric_logger = MetricLogger()

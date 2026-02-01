@@ -55,17 +55,12 @@ class DiT(nn.Module):
     
     def forward(self, x, gamma, time_gaps, mask=None):
         B, N, _ = x.shape
-        
-        time_gaps_clean = time_gaps.clone()
 
-        if mask is not None:
-            time_gaps_clean[~mask.bool().unsqueeze(-1).expand_as(time_gaps)] = -1.0
-        
-        time_condition = self.time_proj(time_gaps_clean)
+        time_condition = self.time_proj(time_gaps)
 
         if mask is not None:
             time_condition = time_condition * mask.unsqueeze(-1)
-        
+
         if gamma.dim() == 1:
             gamma = gamma.unsqueeze(-1)
         
