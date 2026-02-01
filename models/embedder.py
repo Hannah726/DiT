@@ -29,9 +29,14 @@ class CodeEmbedder(nn.Module):
         
         # Don't freeze here - will handle in load_rqvae_codebook
         
-        if rqvae_dim != latent_dim:
+        if aggregation == 'concat':
+            proj_input_dim = rqvae_dim * num_codes
+        else:
+            proj_input_dim = rqvae_dim
+
+        if proj_input_dim != latent_dim:
             self.proj = nn.Sequential(
-                nn.Linear(rqvae_dim, latent_dim),
+                nn.Linear(proj_input_dim, latent_dim),
                 nn.LayerNorm(latent_dim)
             )
         else:
@@ -101,10 +106,6 @@ class CodeEmbedder(nn.Module):
         
         
         if self.freeze_codebook:
-            def freeze_rqvae_only(grad):
-                grad[:1024] = 0
-                return grad
-            self.codebook.weight.register_hook(freeze_rqvae_only)
             print(f"Frozen RQ-VAE codes (0-{self.codebook_size-1}), embeddings {self.codebook_size}-{self.codebook_size+1} trainable")
         else:
             print("All embeddings trainable")
@@ -117,6 +118,15 @@ class CodeEmbedder(nn.Module):
         
         # Direct embedding lookup (handles mask token automatically)
         code_emb = self.codebook(codes)  # (B, N, num_codes, rqvae_dim)
+
+        # Freeze RQ-VAE embeddings if needed
+        if self.freeze_codebook:
+            is_mask_token = (codes == self.codebook_size)
+            code_emb = torch.where(
+                is_mask_token.unsqueeze(-1),
+                code_emb,  # Keep gradient for mask token
+                code_emb.detach()  # Detach RQ-VAE codes
+            )
         
         # Aggregate across num_codes dimension
         if self.aggregation == 'mean':
@@ -125,6 +135,8 @@ class CodeEmbedder(nn.Module):
             code_agg = code_emb.sum(dim=2)
         elif self.aggregation == 'max':
             code_agg = code_emb.max(dim=2)[0]
+        elif self.aggregation == 'concat':
+            code_agg = code_emb.reshape(B, N, -1)  # (B, N, num_codes * rqvae_dim)
         else:
             raise ValueError(f"Unknown aggregation: {self.aggregation}")
         

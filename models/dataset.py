@@ -60,7 +60,7 @@ class EHRDataset(Dataset):
         self.codes = np.load(codes_file, mmap_mode='r')
         
         # Load continuous time gaps
-        time_file = os.path.join(data_dir, f'mimiciv_pad_time.npy')
+        time_file = os.path.join(data_dir, f'mimiciv_hi_pad_time.npy')
         if not os.path.exists(time_file):
             raise FileNotFoundError(f"Time file not found: {time_file}")
         self.time_gaps = np.load(time_file, mmap_mode='r')

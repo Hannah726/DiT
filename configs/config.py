@@ -4,7 +4,7 @@ def get_config(obs_window=12, seed=0):
     return {
         'data_dir': f'data/processed_{obs_window}',
         'codes_dir': f'data/processed_{obs_window}',
-        'time_file': f'mimiciv_pad_time.npy',
+        'time_file': f'mimiciv_hi_pad_time.npy',
         'rqvae_checkpoint': f'data/codebook/{obs_window}/train_RQVAE_indep.pkl',
         'checkpoint_dir': f'outputs/checkpoints/maskdit_{obs_window}h_seed{seed}',
         
@@ -26,13 +26,13 @@ def get_config(obs_window=12, seed=0):
         'time_pad_value': -1.0,
         
         'rqvae_dim': 256,
-        'latent_dim': 128,
+        'latent_dim': 256,
         'hidden_dim': 512,
         'num_layers': 8,
         'num_heads': 8,
         'dropout': 0.1,
-        'code_aggregation': 'sum',
-        'freeze_codebook': True,
+        'code_aggregation': 'concat',
+        'freeze_codebook': False,
         
         'batch_size': 64,
         'lr': 1e-4,

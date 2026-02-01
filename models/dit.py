@@ -18,7 +18,7 @@ class DiT(nn.Module):
         
         self.time_proj = nn.Sequential(
             nn.Linear(self.time_dim, self.time_proj_dim),
-            nn.LayerNorm(self.time_proj_dim),
+            # nn.LayerNorm(self.time_proj_dim),  # Commented: LayerNorm blocks learning
             nn.GELU(),
             nn.Linear(self.time_proj_dim, self.hidden_dim)
         )
@@ -30,7 +30,11 @@ class DiT(nn.Module):
         )
         
         self.input_proj = nn.Linear(self.latent_dim, self.hidden_dim)
-        
+
+        self.max_len = config.get("max_event_size", 256)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_len, self.hidden_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
         self.blocks = nn.ModuleList([
             DiTBlock(
                 hidden_dim=self.hidden_dim,
@@ -49,9 +53,9 @@ class DiT(nn.Module):
             torch.nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.constant_(module.bias, 0)
-            nn.init.constant_(module.weight, 1.0)
+        # elif isinstance(module, nn.LayerNorm):  # Commented: no LayerNorm to init
+        #     nn.init.constant_(module.bias, 0)
+        #     nn.init.constant_(module.weight, 1.0)
     
     def forward(self, x, gamma, time_gaps, mask=None):
         B, N, _ = x.shape
@@ -68,6 +72,7 @@ class DiT(nn.Module):
         gamma_emb = gamma_emb.unsqueeze(1).expand(-1, N, -1)
         
         h = self.input_proj(x)
+        h = h + self.pos_embed[:, :N, :]
         h = h + gamma_emb + time_condition
         
         for block in self.blocks:
@@ -82,12 +87,12 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_dim, num_heads, dropout=0.1):
         super().__init__()
         
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        # self.norm1 = nn.LayerNorm(hidden_dim)  # Commented: LayerNorm blocks learning
         self.self_attn = nn.MultiheadAttention(
             hidden_dim, num_heads, dropout=dropout, batch_first=True
         )
         
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        # self.norm2 = nn.LayerNorm(hidden_dim)  # Commented: LayerNorm blocks learning
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
@@ -98,16 +103,15 @@ class DiTBlock(nn.Module):
 
 
     def forward(self, x, mask=None):
-        if mask is not None:
-            attn_mask = ~mask.bool()
-        else:
-            attn_mask = None
+        # if mask is not None:
+        #     attn_mask = ~mask.bool()
+        # else:
+        #     attn_mask = None
+
+        attn_mask = None
         
-        x = x + self.self_attn(
-            self.norm1(x), self.norm1(x), self.norm1(x),
-            key_padding_mask=attn_mask
-        )[0]
-        
-        x = x + self.mlp(self.norm2(x))
+        # No LayerNorm version
+        x = x + self.self_attn(x, x, x, key_padding_mask=attn_mask)[0]
+        x = x + self.mlp(x)
 
         return x
