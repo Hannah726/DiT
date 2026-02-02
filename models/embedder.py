@@ -2,146 +2,78 @@ import torch
 import torch.nn as nn
 
 
-class CodeEmbedder(nn.Module):
+class HierarchicalEmbedder(nn.Module):
     
     def __init__(
         self,
-        vocab_size: int = 1026,
         codebook_size: int = 1024,
+        mask_token_id: int = 1024,
         rqvae_dim: int = 256,
-        latent_dim: int = 128,
-        num_codes: int = 8,
-        aggregation: str = 'sum',
+        num_quantizers: int = 2,
         freeze_codebook: bool = False
     ):
         super().__init__()
         
-        self.vocab_size = vocab_size
         self.codebook_size = codebook_size
+        self.mask_token_id = mask_token_id
         self.rqvae_dim = rqvae_dim
-        self.latent_dim = latent_dim
-        self.num_codes = num_codes
-        self.aggregation = aggregation
+        self.num_quantizers = num_quantizers
         self.freeze_codebook = freeze_codebook
         
-        # Use single embedding for both RQ-VAE codes and mask token
-        self.codebook = nn.Embedding(vocab_size, rqvae_dim)
-        
-        # Don't freeze here - will handle in load_rqvae_codebook
-        
-        if aggregation == 'concat':
-            proj_input_dim = rqvae_dim * num_codes
-        else:
-            proj_input_dim = rqvae_dim
-
-        if proj_input_dim != latent_dim:
-            self.proj = nn.Sequential(
-                nn.Linear(proj_input_dim, latent_dim),
-                nn.LayerNorm(latent_dim)
-            )
-        else:
-            self.proj = None
+        vocab_size = codebook_size + 1
+        self.codebook_0 = nn.Embedding(vocab_size, rqvae_dim)
+        self.codebook_1 = nn.Embedding(vocab_size, rqvae_dim)
         
         self.apply(self._init_weights)
     
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-        elif isinstance(module, nn.Embedding):
+        if isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-            if module.weight is not None:
-                nn.init.constant_(module.weight, 1.0)
     
     def load_rqvae_codebook(self, rqvae_checkpoint_path):
         checkpoint = torch.load(rqvae_checkpoint_path, map_location='cpu')
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         
-        codebook_keys = [
-            'quantize_model.layers.0._codebook.embed',
-            'quantize_model.layers.1._codebook.embed',
-            'module.quantizer.embedding.weight',
-            'quantizer.embedding.weight',
-        ]
+        codebook_0_weight = None
+        codebook_1_weight = None
         
-        codebook_weight = None
-        for key in codebook_keys:
-            if key in state_dict:
-                codebook_weight = state_dict[key]
-                print(f"Found codebook at: {key}")
-                break
+        for key in state_dict.keys():
+            if 'layers.0' in key and 'embed' in key:
+                codebook_0_weight = state_dict[key]
+            elif 'layers.1' in key and 'embed' in key:
+                codebook_1_weight = state_dict[key]
         
-        if codebook_weight is None:
-            available_keys = [k for k in state_dict.keys() if 'codebook' in k.lower() or 'embed' in k.lower()]
-            raise KeyError(
-                f"Could not find codebook in checkpoint. "
-                f"Available keys: {available_keys[:5]}"
-            )
+        if codebook_0_weight is None or codebook_1_weight is None:
+            raise KeyError("Cannot find both codebook layers in checkpoint")
         
-        # Reshape if needed: [1, 1024, 256] -> [1024, 256]
-        if len(codebook_weight.shape) == 3:
-            codebook_weight = codebook_weight.squeeze(0)
+        if len(codebook_0_weight.shape) == 3:
+            codebook_0_weight = codebook_0_weight.squeeze(0)
+        if len(codebook_1_weight.shape) == 3:
+            codebook_1_weight = codebook_1_weight.squeeze(0)
         
-        if codebook_weight.shape[0] != self.codebook_size:
-            raise ValueError(
-                f"Codebook size mismatch: expected 1024, got {codebook_weight.shape[0]}"
-            )
+        self.codebook_0.weight.data[:self.codebook_size].copy_(codebook_0_weight)
+        self.codebook_1.weight.data[:self.codebook_size].copy_(codebook_1_weight)
         
-        if codebook_weight.shape[1] != self.rqvae_dim:
-            print(
-                f"Warning: RQ-VAE dim mismatch. Expected {self.rqvae_dim}, "
-                f"got {codebook_weight.shape[1]}. Using checkpoint dim."
-            )
-            self.rqvae_dim = codebook_weight.shape[1]
-            self.codebook = nn.Embedding(self.vocab_size, self.rqvae_dim)
-        
-        # Load only 0-1023 from RQ-VAE
-        self.codebook.weight.data[:self.codebook_size].copy_(codebook_weight)
-        print(f"Loaded RQ-VAE codebook: {codebook_weight.shape}")
-        print(f"Embedding {self.codebook_size} (mask token) initialized randomly")
-        
+        print(f"Loaded codebook_0: {codebook_0_weight.shape}")
+        print(f"Loaded codebook_1: {codebook_1_weight.shape}")
         
         if self.freeze_codebook:
-            print(f"Frozen RQ-VAE codes (0-{self.codebook_size-1}), embeddings {self.codebook_size}-{self.codebook_size+1} trainable")
-        else:
-            print("All embeddings trainable")
+            print("Frozen RQ-VAE codes, MASK token trainable")
     
     def forward(self, codes):
-        B, N, num_codes = codes.shape
+        B, N, num_q = codes.shape
+        assert num_q == self.num_quantizers
         
-        if num_codes != self.num_codes:
-            raise ValueError(f"Expected {self.num_codes} codes per event, got {num_codes}")
+        k1 = codes[:, :, 0]
+        k2 = codes[:, :, 1]
         
-        # Direct embedding lookup (handles mask token automatically)
-        code_emb = self.codebook(codes)  # (B, N, num_codes, rqvae_dim)
-
-        # Freeze RQ-VAE embeddings if needed
+        e1 = self.codebook_0(k1)
+        e2 = self.codebook_1(k2)
+        
         if self.freeze_codebook:
-            is_mask_token = (codes == self.codebook_size)
-            code_emb = torch.where(
-                is_mask_token.unsqueeze(-1),
-                code_emb,  # Keep gradient for mask token
-                code_emb.detach()  # Detach RQ-VAE codes
-            )
+            is_mask_1 = (k1 == self.mask_token_id)
+            is_mask_2 = (k2 == self.mask_token_id)
+            e1 = torch.where(is_mask_1.unsqueeze(-1), e1, e1.detach())
+            e2 = torch.where(is_mask_2.unsqueeze(-1), e2, e2.detach())
         
-        # Aggregate across num_codes dimension
-        if self.aggregation == 'mean':
-            code_agg = code_emb.mean(dim=2)
-        elif self.aggregation == 'sum':
-            code_agg = code_emb.sum(dim=2)
-        elif self.aggregation == 'max':
-            code_agg = code_emb.max(dim=2)[0]
-        elif self.aggregation == 'concat':
-            code_agg = code_emb.reshape(B, N, -1)  # (B, N, num_codes * rqvae_dim)
-        else:
-            raise ValueError(f"Unknown aggregation: {self.aggregation}")
-        
-        # Project if needed
-        if self.proj is not None:
-            code_agg = self.proj(code_agg)
-        
-        return code_agg
+        return e1 + e2

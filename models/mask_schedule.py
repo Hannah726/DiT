@@ -13,8 +13,8 @@ def linear_schedule(step, total_steps, min_ratio=0.05, max_ratio=0.95):
     return max_ratio - (max_ratio - min_ratio) * progress
 
 
-def random_mask(codes, mask_ratio, mask_token_id=1024, valid_mask=None):
-    B, N, C = codes.shape
+def nested_random_mask(codes, mask_ratio, mask_token_id=1024, valid_mask=None, k2_independent_ratio=0.3):
+    B, N, num_q = codes.shape
     device = codes.device
     
     masked_codes = codes.clone()
@@ -37,10 +37,25 @@ def random_mask(codes, mask_ratio, mask_token_id=1024, valid_mask=None):
         num_mask = max(1, int(num_valid * mask_ratio[b].item()))
         valid_indices = torch.where(valid_pos)[0]
         perm = torch.randperm(len(valid_indices), device=device)
-        mask_indices = valid_indices[perm[:num_mask]]
+        mask_indices_k1 = valid_indices[perm[:num_mask]]
         
-        masked_codes[b, mask_indices, :] = mask_token_id
-        mask_positions[b, mask_indices, :] = True
+        masked_codes[b, mask_indices_k1, 0] = mask_token_id
+        mask_positions[b, mask_indices_k1, 0] = True
+        
+        masked_codes[b, mask_indices_k1, 1] = mask_token_id
+        mask_positions[b, mask_indices_k1, 1] = True
+        
+        unmasked_k1 = valid_pos.clone()
+        unmasked_k1[mask_indices_k1] = False
+        unmasked_k1_indices = torch.where(unmasked_k1)[0]
+        
+        if len(unmasked_k1_indices) > 0:
+            num_k2_mask = max(1, int(len(unmasked_k1_indices) * k2_independent_ratio))
+            perm_k2 = torch.randperm(len(unmasked_k1_indices), device=device)
+            mask_indices_k2 = unmasked_k1_indices[perm_k2[:num_k2_mask]]
+            
+            masked_codes[b, mask_indices_k2, 1] = mask_token_id
+            mask_positions[b, mask_indices_k2, 1] = True
     
     return masked_codes, mask_positions
 
@@ -55,7 +70,7 @@ def sample_mask_ratio(schedule_fn, total_steps, batch_size=1, device='cpu'):
 
 
 def unmask_by_confidence(codes, logits, num_unmask, mask_token_id=1024):
-    B, N, C, V = logits.shape
+    B, N, num_q, V = logits.shape
     updated_codes = codes.clone()
     
     probs = torch.softmax(logits, dim=-1)
@@ -77,8 +92,8 @@ def unmask_by_confidence(codes, logits, num_unmask, mask_token_id=1024):
         masked_indices = torch.where(masked.flatten())[0]
         topk_global_indices = masked_indices[topk_local_indices]
         
-        topk_n = topk_global_indices // C
-        topk_c = topk_global_indices % C
+        topk_n = topk_global_indices // num_q
+        topk_c = topk_global_indices % num_q
         
         updated_codes[b, topk_n, topk_c] = predictions[b, topk_n, topk_c]
     

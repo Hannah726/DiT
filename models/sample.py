@@ -28,7 +28,9 @@ class MaskGITSampler:
         num_samples,
         num_events,
         time_gaps=None,
-        batch_size=32
+        batch_size=32,
+        prefix_codes=None,
+        prefix_length=None
     ):
         all_codes = []
         all_times = []
@@ -45,8 +47,14 @@ class MaskGITSampler:
             else:
                 batch_time_gaps = None
             
+            if prefix_codes is not None:
+                batch_prefix = prefix_codes[start_idx:end_idx]
+            else:
+                batch_prefix = None
+            
             batch_codes = self._sample_batch(
-                current_batch_size, num_events, batch_time_gaps
+                current_batch_size, num_events, batch_time_gaps,
+                batch_prefix, prefix_length
             )
             
             all_codes.append(batch_codes.cpu().numpy())
@@ -67,12 +75,12 @@ class MaskGITSampler:
         return all_codes, all_times
     
     @torch.no_grad()
-    def _sample_batch(self, batch_size, num_events, time_gaps):
+    def _sample_batch(self, batch_size, num_events, time_gaps, prefix_codes=None, prefix_length=None):
         model = self.model.module if hasattr(self.model, 'module') else self.model
-        num_codes = self.config['num_codes']
+        num_q = self.config['num_quantizers']
 
         codes = torch.full(
-            (batch_size, num_events, num_codes),
+            (batch_size, num_events, num_q),
             self.mask_token_id,
             device=self.device,
             dtype=torch.long
@@ -90,11 +98,9 @@ class MaskGITSampler:
             )
             mask = torch.ones(batch_size, num_events, device=self.device)
 
-        # Record total masked positions (within valid regions)
         total_masked = ((codes == self.mask_token_id) & mask.bool().unsqueeze(-1)).sum().item()
 
         for step in range(self.num_iterations):
-            # Current iteration's mask ratio (decreasing from high to low)
             gamma = cosine_schedule(
                 step, self.num_iterations,
                 self.config['mask_ratio_min'],
@@ -107,27 +113,112 @@ class MaskGITSampler:
             if self.temperature != 1.0:
                 logits = logits / self.temperature
 
-            # Count current masked tokens
             num_masked = (codes == self.mask_token_id).sum().item()
 
             if num_masked == 0:
                 break
 
-            # Key fix: compute unmask count based on schedule
             if step < self.num_iterations - 1:
-                # Next step's gamma
                 next_gamma = cosine_schedule(
                     step + 1, self.num_iterations,
                     self.config['mask_ratio_min'],
                     self.config['mask_ratio_max']
                 )
-                # From current gamma to next gamma, compute how many to unmask
-                # gamma represents "ratio that should remain masked"
-                # so unmask count = total * (current_gamma - next_gamma)
                 num_unmask = int(total_masked * (gamma - next_gamma))
-                num_unmask = max(1, num_unmask)  # unmask at least 1
+                num_unmask = max(1, num_unmask)
             else:
-                # Last step: unmask all remaining
+                num_unmask = num_masked
+
+            codes = unmask_by_confidence(codes, logits, num_unmask, self.mask_token_id)
+            
+            if prefix_codes is not None and prefix_length is not None:
+                codes[:, :prefix_length, :] = prefix_codes[:, :prefix_length, :]
+
+        return codes
+    
+    @torch.no_grad()
+    def sample_with_guidance(
+        self,
+        num_samples,
+        num_events,
+        time_gaps,
+        classifier_fn,
+        guidance_scale=1.0,
+        batch_size=32
+    ):
+        all_codes = []
+        
+        num_batches = (num_samples + batch_size - 1) // batch_size
+        
+        for batch_idx in tqdm(range(num_batches), desc="Guided Sampling"):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, num_samples)
+            current_batch_size = end_idx - start_idx
+            
+            batch_time_gaps = time_gaps[start_idx:end_idx]
+            
+            batch_codes = self._sample_batch_guided(
+                current_batch_size, num_events, batch_time_gaps,
+                classifier_fn, guidance_scale
+            )
+            
+            all_codes.append(batch_codes.cpu().numpy())
+        
+        return np.concatenate(all_codes, axis=0)
+    
+    def _sample_batch_guided(self, batch_size, num_events, time_gaps, classifier_fn, guidance_scale):
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        num_q = self.config['num_quantizers']
+
+        codes = torch.full(
+            (batch_size, num_events, num_q),
+            self.mask_token_id,
+            device=self.device,
+            dtype=torch.long
+        )
+
+        if isinstance(time_gaps, np.ndarray):
+            time_gaps = torch.from_numpy(time_gaps).float().to(self.device)
+        mask = (time_gaps.squeeze(-1) >= 0).float()
+
+        total_masked = ((codes == self.mask_token_id) & mask.bool().unsqueeze(-1)).sum().item()
+
+        for step in range(self.num_iterations):
+            gamma = cosine_schedule(
+                step, self.num_iterations,
+                self.config['mask_ratio_min'],
+                self.config['mask_ratio_max']
+            )
+            gamma_tensor = torch.full((batch_size,), gamma, device=self.device)
+
+            codes.requires_grad_(True)
+            
+            logits = model(codes, time_gaps, gamma_tensor, mask)
+            
+            if classifier_fn is not None:
+                class_logits = classifier_fn(codes)
+                grad = torch.autograd.grad(class_logits.sum(), codes)[0]
+                logits = logits + guidance_scale * grad.unsqueeze(-1)
+            
+            codes = codes.detach()
+
+            if self.temperature != 1.0:
+                logits = logits / self.temperature
+
+            num_masked = (codes == self.mask_token_id).sum().item()
+
+            if num_masked == 0:
+                break
+
+            if step < self.num_iterations - 1:
+                next_gamma = cosine_schedule(
+                    step + 1, self.num_iterations,
+                    self.config['mask_ratio_min'],
+                    self.config['mask_ratio_max']
+                )
+                num_unmask = int(total_masked * (gamma - next_gamma))
+                num_unmask = max(1, num_unmask)
+            else:
                 num_unmask = num_masked
 
             codes = unmask_by_confidence(codes, logits, num_unmask, self.mask_token_id)
@@ -145,8 +236,7 @@ def parse_args():
     parser.add_argument('--num_events', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
     
-    parser.add_argument('--time_source', type=str, default='zero',
-                        choices=['data', 'zero'])
+    parser.add_argument('--time_source', type=str, default='zero', choices=['data', 'zero'])
     parser.add_argument('--time_data_path', type=str, default=None)
     parser.add_argument('--data_dir', type=str, default=None)
     

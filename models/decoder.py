@@ -3,25 +3,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class CodeDecoder(nn.Module):
+class HierarchicalDecoder(nn.Module):
     
     def __init__(
         self,
-        latent_dim: int = 128,
-        hidden_dim: int = 256,
+        d_model: int = 256,
         codebook_size: int = 1024,
-        num_codes: int = 8,
+        num_quantizers: int = 2,
+        hidden_dim: int = 512,
         dropout: float = 0.1
     ):
         super().__init__()
         
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
+        self.d_model = d_model
         self.codebook_size = codebook_size
-        self.num_codes = num_codes
+        self.num_quantizers = num_quantizers
+        self.hidden_dim = hidden_dim
         
         self.mlp = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(d_model, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -31,10 +31,8 @@ class CodeDecoder(nn.Module):
             nn.Dropout(dropout)
         )
         
-        self.code_heads = nn.ModuleList([
-            nn.Linear(hidden_dim, codebook_size)
-            for _ in range(num_codes)
-        ])
+        self.head_k1 = nn.Linear(hidden_dim, codebook_size)
+        self.head_k2 = nn.Linear(hidden_dim, codebook_size)
         
         self.apply(self._init_weights)
     
@@ -49,17 +47,15 @@ class CodeDecoder(nn.Module):
             if module.weight is not None:
                 nn.init.constant_(module.weight, 1.0)
     
-    def forward(self, latent, return_logits=False):
-        B, N, _ = latent.shape
+    def forward(self, x, return_logits=False):
+        B, N, _ = x.shape
         
-        h = self.mlp(latent)
+        h = self.mlp(x)
         
-        logits_list = []
-        for head in self.code_heads:
-            logits = head(h)
-            logits_list.append(logits)
+        logits_k1 = self.head_k1(h)
+        logits_k2 = self.head_k2(h)
         
-        logits = torch.stack(logits_list, dim=2)
+        logits = torch.stack([logits_k1, logits_k2], dim=2)
         
         if return_logits:
             return logits
@@ -67,19 +63,24 @@ class CodeDecoder(nn.Module):
             codes = logits.argmax(dim=-1)
             return codes
     
-    def compute_loss(self, latent, target_codes, mask=None):
-        B, N, num_codes = target_codes.shape
+    def compute_loss(self, x, target_codes, mask=None, label_smoothing=0.0):
+        B, N, num_q = target_codes.shape
         
-        logits = self.forward(latent, return_logits=True)
+        logits = self.forward(x, return_logits=True)
         
-        logits_flat = logits.reshape(B * N * num_codes, self.codebook_size)
-        target_flat = target_codes.reshape(B * N * num_codes)
+        logits_flat = logits.reshape(B * N * num_q, self.codebook_size)
+        target_flat = target_codes.reshape(B * N * num_q)
         
-        loss = F.cross_entropy(logits_flat, target_flat, reduction='none')
-        loss = loss.reshape(B, N, num_codes)
+        loss = F.cross_entropy(
+            logits_flat,
+            target_flat,
+            reduction='none',
+            label_smoothing=label_smoothing
+        )
+        loss = loss.reshape(B, N, num_q)
         
         if mask is not None:
-            mask_expanded = mask.unsqueeze(-1).expand(-1, -1, num_codes)
+            mask_expanded = mask.unsqueeze(-1).expand(-1, -1, num_q)
             loss = (loss * mask_expanded).sum() / (mask_expanded.sum() + 1e-8)
         else:
             loss = loss.mean()
@@ -88,7 +89,7 @@ class CodeDecoder(nn.Module):
             pred_codes = logits.argmax(dim=-1)
             
             if mask is not None:
-                mask_expanded = mask.unsqueeze(-1).expand(-1, -1, num_codes)
+                mask_expanded = mask.unsqueeze(-1).expand(-1, -1, num_q)
                 correct = ((pred_codes == target_codes) * mask_expanded).sum()
                 total = mask_expanded.sum()
             else:

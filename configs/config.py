@@ -12,26 +12,27 @@ def get_config(obs_window=12, seed=0):
         'seed': seed,
         'max_event_size': max_events[obs_window],
 
-        'num_codes': 8,
-        'codebook_size': 1024,  # size of rqvae codebook
-        'mask_token_id': 1024,  # mask token
-        'vocab_size': 1025,
-
+        'num_codes': 2,
+        'num_quantizers': 2,
+        'codebook_size': 1024,
+        'mask_token_id': 1024,
+        
         'mask_schedule': 'cosine',
         'mask_ratio_min': 0.05,
         'mask_ratio_max': 0.95,
+        'label_smoothing': 0.1,
+        'nested_mask_k2_ratio': 0.3,
         
         'time_dim': 1,
         'time_proj_dim': 128,
         'time_pad_value': -1.0,
         
         'rqvae_dim': 256,
-        'latent_dim': 256,
-        'hidden_dim': 512,
-        'num_layers': 8,
+        'd_model': 256,
+        'num_layers': 12,
         'num_heads': 8,
         'dropout': 0.1,
-        'code_aggregation': 'concat',
+        'use_adaln': True,
         'freeze_codebook': False,
         
         'batch_size': 64,
