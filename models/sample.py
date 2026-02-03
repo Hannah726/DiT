@@ -77,10 +77,10 @@ class MaskGITSampler:
     @torch.no_grad()
     def _sample_batch(self, batch_size, num_events, time_gaps, prefix_codes=None, prefix_length=None):
         model = self.model.module if hasattr(self.model, 'module') else self.model
-        num_q = self.config['num_quantizers']
+        num_total = self.config['spatial_dim'] * self.config['num_quantizers']
 
         codes = torch.full(
-            (batch_size, num_events, num_q),
+            (batch_size, num_events, num_total),
             self.mask_token_id,
             device=self.device,
             dtype=torch.long
@@ -130,7 +130,7 @@ class MaskGITSampler:
                 num_unmask = num_masked
 
             codes = unmask_by_confidence(codes, logits, num_unmask, self.mask_token_id)
-            
+
             if prefix_codes is not None and prefix_length is not None:
                 codes[:, :prefix_length, :] = prefix_codes[:, :prefix_length, :]
 
@@ -168,10 +168,10 @@ class MaskGITSampler:
     
     def _sample_batch_guided(self, batch_size, num_events, time_gaps, classifier_fn, guidance_scale):
         model = self.model.module if hasattr(self.model, 'module') else self.model
-        num_q = self.config['num_quantizers']
+        num_total = self.config['spatial_dim'] * self.config['num_quantizers']
 
         codes = torch.full(
-            (batch_size, num_events, num_q),
+            (batch_size, num_events, num_total),
             self.mask_token_id,
             device=self.device,
             dtype=torch.long

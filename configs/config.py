@@ -12,7 +12,7 @@ def get_config(obs_window=12, seed=0):
         'seed': seed,
         'max_event_size': max_events[obs_window],
 
-        'num_codes': 2,
+        'spatial_dim': 4,
         'num_quantizers': 2,
         'codebook_size': 1024,
         'mask_token_id': 1024,
