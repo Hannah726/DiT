@@ -20,7 +20,6 @@ def nested_random_mask(codes, mask_ratio, mask_token_id=1024, valid_mask=None, k
     if isinstance(mask_ratio, float):
         mask_ratio = torch.full((B,), mask_ratio, device=device)
     
-    # 1. Event-level mask (K1+K2)
     noise_event = torch.rand(B, N, device=device)
     if valid_mask is not None:
         noise_event = torch.where(valid_mask.bool(), noise_event, torch.ones_like(noise_event) * 2.0)
@@ -68,17 +67,36 @@ def unmask_by_confidence(codes, logits, num_unmask, mask_token_id=1024):
     B, N, L, V = logits.shape
     device = codes.device
     
+    # Hannah, we use temperature-based multinomial sampling to break the "Code 1023" dominance
+    # 1. Apply temperature and get probabilities
+    # logits: (B, N, L, V)
     probs = torch.softmax(logits, dim=-1)
-    confidence, predictions = probs.max(dim=-1) # (B, N, L)
+    
+    # 2. Sample from distribution instead of argmax
+    B, N, L, V = logits.shape
+    probs_flat = probs.view(-1, V)
+    predictions_flat = torch.multinomial(probs_flat, num_samples=1).squeeze(-1)
+    predictions = predictions_flat.view(B, N, L)
+    
+    # 3. Get confidence (max prob) for scheduling
+    confidence, _ = probs.max(dim=-1) # (B, N, L)
     
     is_masked = (codes == mask_token_id)
+    # Only consider confidence for currently masked positions
     confidence = torch.where(is_masked, confidence, torch.zeros_like(confidence) - 1.0)
     
     conf_flat = confidence.view(B, -1)
-    num_unmask = min(num_unmask, is_masked.sum().item() // B) # Simplified for batch
+    # Ensure we don't try to unmask more than available
+    actual_masked_per_sample = is_masked.sum().item() // B
+    num_unmask = min(num_unmask, actual_masked_per_sample)
     
+    if num_unmask <= 0:
+        return codes
+
+    # 4. Pick the most confident positions to unmask
     _, topk_indices = torch.topk(conf_flat, k=num_unmask, dim=1)
     
+    # 5. Update only the selected positions
     updates = predictions.view(B, -1).gather(1, topk_indices)
     codes_flat = codes.view(B, -1)
     codes_flat.scatter_(1, topk_indices, updates)

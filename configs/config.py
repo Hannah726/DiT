@@ -20,7 +20,7 @@ def get_config(obs_window=12, seed=0):
         'mask_schedule': 'cosine',
         'mask_ratio_min': 0.05,
         'mask_ratio_max': 0.95,
-        'label_smoothing': 0.1,
+        'label_smoothing': 0.05,
         'nested_mask_k2_ratio': 0.3,
         
         'time_dim': 1,
@@ -36,16 +36,16 @@ def get_config(obs_window=12, seed=0):
         'freeze_codebook': False,
         
         'batch_size': 64,
-        'lr': 1e-4,
+        'lr': 5e-5,
         'weight_decay': 0.01,
-        'warmup_steps': 1000,
-        'epochs': 100,
+        'warmup_steps': 2000,
+        'epochs': 200,
         'gradient_accumulation_steps': 1,
-        'grad_clip': 1.0,
-        'use_amp': True,
+        'grad_clip': 0.5,
+        'use_amp': False,
         
         'num_iterations': 10,
-        'temperature': 1.0,
+        'temperature': 1,
         
         'comprehensive_val_interval': 10,
         'log_interval': 100,
@@ -55,8 +55,8 @@ def get_config(obs_window=12, seed=0):
         'project_name': 'MaskDiT-EHR',
         'run_name': f'maskdit_{obs_window}h_seed{seed}',
         'use_wandb': False,
-        'num_workers': 4,
-        'compile_model': False,
+        'num_workers': 8,
+        'compile_model': True,
     }
 
 
